@@ -11,7 +11,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import (
+    make_gdn_hybrid_plan,
+    make_nemotron_hybrid_plan,
+    make_stub_runner,
+)
 
 BLOCK_SIZE = 16
 DTYPE = torch.bfloat16
@@ -33,7 +37,7 @@ def _policy(
     head_dim=256,
     sliding_window_per_layer=None,
 ):
-    # ``is_mla``/``is_hybrid`` are derived from the model config, not settable.
+    # ``is_mla`` derives from model args; ``is_hybrid`` comes from the model config.
     model_args = {"kv_lora_rank": head_dim} if is_mla else {}
     runner = make_stub_runner(
         model_args=model_args,
@@ -93,20 +97,89 @@ def test_plain_attention_spec_is_unchanged() -> None:
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
 
 
+def test_hybrid_spec_omits_stateless_layers() -> None:
+    runner = make_stub_runner(
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            get_head_size=lambda: 128,
+            max_model_len=2048,
+            is_hybrid=True,
+        ),
+        num_layers=4,
+        hybrid_runtime_plan=make_nemotron_hybrid_plan("M-*M"),
+        num_kv_heads=1,
+        head_dim=128,
+        kv_cache_dtype=mx.float16,
+        cache_config=SimpleNamespace(
+            block_size=544,
+            mamba_page_size_padded=None,
+            mamba_block_size=2048,
+            mamba_cache_mode="none",
+        ),
+    )
+
+    specs = runner._cache_policy.get_kv_cache_spec()
+
+    assert set(specs) == {
+        "layers.0.mixer",
+        "layers.2.self_attn",
+        "layers.3.mixer",
+    }
+
+
+def test_hybrid_one_sequence_estimate_charges_vllm_group_padding() -> None:
+    """vLLM pads 5 state layers to 6 groups of 2 attention layers; charge them."""
+    plan = make_nemotron_hybrid_plan("MMMMM**")
+    runner = make_stub_runner(
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            get_head_size=lambda: 128,
+            max_model_len=2048,
+            is_hybrid=True,
+        ),
+        num_layers=7,
+        hybrid_runtime_plan=plan,
+        num_kv_heads=1,
+        head_dim=128,
+        kv_cache_dtype=mx.float16,
+        cache_config=SimpleNamespace(
+            block_size=544,
+            mamba_page_size_padded=None,
+            mamba_block_size=2048,
+            mamba_cache_mode="none",
+        ),
+    )
+    attention_layer_bytes = 2 * cdiv(2048, 544) * 544 * 2 * 1 * 128
+    state_layer_bytes = plan.state_bytes_per_layer(2)
+    expected = 2 * attention_layer_bytes + 6 * state_layer_bytes
+
+    estimate = runner._cache_policy.estimate_one_sequence_kv_bytes(
+        max_model_len=2048, block_size=544
+    )
+
+    assert estimate == expected
+
+
 def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
     attention_block_size = 544
     max_model_len = 2048
     runner = make_stub_runner(
-        model_args={"full_attention_interval": 2},
         model_config=SimpleNamespace(
             runner_type="generate",
             get_head_size=lambda: 128,
             max_model_len=max_model_len,
+            is_hybrid=True,
         ),
         num_layers=2,
-        num_sdpa_layers=1,
-        num_linear_layers=1,
-        sdpa_layer_indices={1},
+        hybrid_runtime_plan=make_gdn_hybrid_plan(
+            2,
+            [1],
+            conv_kernel_dim=4,
+            conv_dim=64,
+            num_v_heads=1,
+            value_head_dim=64,
+            key_head_dim=64,
+        ),
         num_kv_heads=1,
         head_dim=128,
         kv_cache_dtype=mx.float16,
@@ -116,11 +189,6 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
             mamba_block_size=max_model_len,
             mamba_cache_mode="none",
         ),
-        linear_conv_kernel_dim=4,
-        linear_conv_dim=64,
-        linear_num_v_heads=1,
-        linear_value_head_dim=64,
-        linear_key_head_dim=64,
     )
 
     spec = runner._cache_policy.get_kv_cache_spec()["layers.0.linear_attn"]

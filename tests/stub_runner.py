@@ -3,13 +3,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
-import torch
 
 import vllm_metal.v1.model_runner as mr
+from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
+from vllm_metal.attention.runtime.hybrid_plan import (
+    ATTENTION_LAYER,
+    STATE_LAYER,
+    HybridLayerPlan,
+    HybridRuntimePlan,
+    RecurrentStateGeometry,
+)
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.decode_pipeline import DecodePipeline
 from vllm_metal.v1.lora import MetalLoRARuntime
@@ -24,13 +32,15 @@ from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 def make_stub_runner(
     *,
     model_args: dict[str, Any] | None = None,
+    is_hybrid: bool = False,
     **attrs: Any,
 ) -> mr.MetalModelRunner:
     """Create a ``MetalModelRunner`` stub without running ``__init__``.
 
     Sets sensible defaults for all internal attributes.  ``_vocab_size``
     is derived from ``model_args["vocab_size"]`` automatically — never
-    set it separately.  Pass keyword arguments to override any attribute.
+    set it separately.  ``is_hybrid`` lands on the default ``model_config``.
+    Pass keyword arguments to override any attribute.
     """
     runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
 
@@ -40,6 +50,7 @@ def make_stub_runner(
         "vllm_config": SimpleNamespace(
             speculative_config=None,
             lora_config=None,
+            load_config=SimpleNamespace(download_dir=None, ignore_patterns=[]),
             # The value MetalPlatform resolves for the in-process executor.
             parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
         ),
@@ -49,7 +60,10 @@ def make_stub_runner(
             mamba_cache_mode="none",
         ),
         "model_config": SimpleNamespace(
-            runner_type="generate", get_head_size=lambda: 128, max_model_len=2048
+            runner_type="generate",
+            get_head_size=lambda: 128,
+            max_model_len=2048,
+            is_hybrid=is_hybrid,
         ),
         "model": object(),
         "tokenizer": None,
@@ -57,8 +71,10 @@ def make_stub_runner(
         "_multimodal_adapter": None,
         "_gemma4_mtp_assistant": None,
         "_drafter": None,
+        "_draft_dims": None,
         "encoder_cache": None,
         "_paged_attention_runtime": None,
+        "hybrid_runtime_plan": None,
         "_paged_block_size": 0,
         "_paged_scheduler_group_indices": (),
         "_paged_group_block_sizes": (),
@@ -70,6 +86,7 @@ def make_stub_runner(
         "_intermediate_forward_supported": True,
         "_draft_token_ids": None,
         "_execute_model_state": None,
+        "_selective_logits_supported": False,
         "pp": None,
         "_pp_model": None,
         "_model_adapter": DefaultModelAdapter(),
@@ -78,8 +95,8 @@ def make_stub_runner(
         "head_dim_per_layer": None,
         "sliding_window_per_layer": None,
         "use_async_scheduling": True,
-        "device": torch.device("cpu"),
         "_sampler": None,
+        "_native_sample_key": None,
         "_structured_output_applier": MetalStructuredOutputApplier(),
         "_lora": MetalLoRARuntime(),
         "_yoco_cache_mapping": None,
@@ -114,7 +131,10 @@ def make_stub_runner(
             validate=runner._validate_scheduled_outputs,
         )
 
-    # Derive _vocab_size from model_args — single source of truth.
+    # Derive _vocab_size from model_args — single source of truth. The
+    # deferred sampler reads it on every step, so default it when the test
+    # does not care about vocab shape.
+    _model_args.setdefault("vocab_size", 32)
     if "vocab_size" in _model_args:
         runner._vocab_size = _model_args["vocab_size"]
 
@@ -200,4 +220,80 @@ def make_gemma4_mixed_mha_runner(
         kv_heads_per_layer=kv_heads_per_layer,
         head_dim_per_layer=head_dim_per_layer,
         sliding_window_per_layer=sliding_windows,
+    )
+
+
+# Tiny mlx-lm Nemotron-H ModelArgs shared by the real-module tests.
+NEMOTRON_H_TINY_ARGS: dict[str, Any] = {
+    "model_type": "nemotron_h",
+    "vocab_size": 100,
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 2,
+    "max_position_embeddings": 512,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "attention_bias": False,
+    "mamba_num_heads": 4,
+    "mamba_head_dim": 8,
+    "mamba_proj_bias": False,
+    "ssm_state_size": 32,
+    "conv_kernel": 4,
+    "n_groups": 2,
+    "mlp_bias": False,
+    "layer_norm_epsilon": 1e-5,
+    "use_bias": False,
+    "use_conv_bias": True,
+    "hybrid_override_pattern": "M*",
+}
+
+
+# Production family policy, resolved through the family table from the
+# smallest valid hybrid layout so tests cannot drift from what production installs.
+_GDN_FAMILY_SPEC = build_hybrid_runtime_plan(
+    {
+        "model_type": "qwen3_5",
+        "full_attention_interval": 2,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 1,
+        "linear_key_head_dim": 1,
+        "linear_value_head_dim": 1,
+        "linear_conv_kernel_dim": 1,
+    },
+    2,
+).family
+
+
+def make_gdn_hybrid_plan(
+    num_layers: int,
+    attention_indices: Iterable[int],
+    *,
+    conv_kernel_dim: int,
+    conv_dim: int,
+    num_v_heads: int,
+    value_head_dim: int,
+    key_head_dim: int,
+) -> HybridRuntimePlan:
+    """Build a GDN hybrid plan with explicit topology and geometry."""
+    attention = frozenset(attention_indices)
+    layer_roles = tuple(
+        ATTENTION_LAYER if i in attention else STATE_LAYER for i in range(num_layers)
+    )
+    return HybridRuntimePlan(
+        layers=HybridLayerPlan(layer_roles=layer_roles),
+        family=_GDN_FAMILY_SPEC,
+        geometry=RecurrentStateGeometry(
+            conv_kernel_dim=conv_kernel_dim,
+            conv_dim=conv_dim,
+            num_v_heads=num_v_heads,
+            value_head_dim=value_head_dim,
+            key_head_dim=key_head_dim,
+        ),
+    )
+
+
+def make_nemotron_hybrid_plan(pattern: str) -> HybridRuntimePlan:
+    """Build a Nemotron-H plan for ``pattern`` through the family table."""
+    return build_hybrid_runtime_plan(
+        {**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": pattern}, len(pattern)
     )

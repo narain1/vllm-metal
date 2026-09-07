@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from vllm.lora.layers import LoRAMapping
 from vllm.sampling_params import SamplingParams
 
@@ -45,6 +46,128 @@ def test_punica_add_lora_linear_no_lora_is_a_passthrough() -> None:
     np.testing.assert_array_equal(np.array(out), np.array(y))
 
 
+def test_punica_contiguous_run_uses_actual_adapter_rank() -> None:
+    wrapper = punica_mod.PunicaWrapperMLX(
+        max_num_batched_tokens=1, max_batches=1, max_loras=1
+    )
+    wrapper.update_metadata(
+        LoRAMapping(index_mapping=(7,), prompt_mapping=(7,), is_prefill=True),
+        lora_index_to_id=[7],
+    )
+    a_stacked = mx.array(
+        np.array([[[1.0], [100.0], [100.0], [100.0]]], dtype=np.float32)
+    )
+    b_stacked = mx.array(np.array([[[1.0, 100.0, 100.0, 100.0]]], dtype=np.float32))
+
+    out = wrapper.add_lora_linear(
+        mx.zeros((1, 1), dtype=mx.float32),
+        mx.ones((1, 1), dtype=mx.float32),
+        a_stacked,
+        b_stacked,
+        scale=1.0,
+        lora_ranks=[1],
+    )
+
+    np.testing.assert_array_equal(np.array(out), [[1.0]])
+
+
+def test_punica_contiguous_prefill_rank_zero_is_passthrough() -> None:
+    wrapper = punica_mod.PunicaWrapperMLX(
+        max_num_batched_tokens=2, max_batches=1, max_loras=1
+    )
+    wrapper.update_metadata(
+        LoRAMapping(index_mapping=(7, 7), prompt_mapping=(7,), is_prefill=True),
+        lora_index_to_id=[7],
+    )
+
+    y = mx.ones((2, 1), dtype=mx.float32)
+    out = wrapper.add_lora_linear(
+        y,
+        mx.ones((2, 1), dtype=mx.float32),
+        mx.ones((1, 1, 1), dtype=mx.float32),
+        mx.ones((1, 1, 1), dtype=mx.float32),
+        scale=1.0,
+        lora_ranks=[0],
+    )
+
+    assert out is y
+
+
+def test_punica_handles_fragmented_routing() -> None:
+    wrapper = punica_mod.PunicaWrapperMLX(
+        max_num_batched_tokens=80, max_batches=80, max_loras=2
+    )
+    index_mapping = tuple(11 if i % 2 == 0 else 22 for i in range(80))
+    wrapper.update_metadata(
+        LoRAMapping(
+            index_mapping=index_mapping,
+            prompt_mapping=(11, 22),
+            is_prefill=True,
+        ),
+        lora_index_to_id=[11, 22],
+    )
+    a_stacked = mx.array(np.array([[[1.0, 0.0]], [[0.0, 1.0]]], dtype=np.float32))
+    b_stacked = mx.array(np.array([[[1.0]], [[10.0]]], dtype=np.float32))
+    x = mx.array(np.ones((80, 2), dtype=np.float32))
+    y = mx.zeros((80, 1), dtype=mx.float32)
+
+    out = wrapper.add_lora_linear(y, x, a_stacked, b_stacked, scale=1.0)
+    np.testing.assert_array_equal(
+        np.array(out).flatten(),
+        [1.0 if i % 2 == 0 else 10.0 for i in range(80)],
+    )
+
+
+def test_punica_output_dtype_matches_base_for_all_routing_paths() -> None:
+    routing_cases = (
+        ((11, 22, 11, 22), False, np.float32),
+        ((11, 11, 11, 11), True, np.float32),
+        (tuple(11 if i % 2 == 0 else 22 for i in range(80)), True, np.float32),
+    )
+
+    for index_mapping, is_prefill, weight_dtype in routing_cases:
+        a_stacked = mx.array(np.array([[[1.0]], [[2.0]]], dtype=weight_dtype))
+        b_stacked = mx.array(np.array([[[3.0]], [[4.0]]], dtype=weight_dtype))
+        x = mx.ones((len(index_mapping), 1), dtype=mx.float16)
+        y = mx.zeros((len(index_mapping), 1), dtype=mx.float16)
+        wrapper = punica_mod.PunicaWrapperMLX(
+            max_num_batched_tokens=len(index_mapping),
+            max_batches=len(index_mapping),
+            max_loras=2,
+        )
+        wrapper.update_metadata(
+            LoRAMapping(
+                index_mapping=index_mapping,
+                prompt_mapping=(11, 22),
+                is_prefill=is_prefill,
+            ),
+            lora_index_to_id=[11, 22],
+        )
+
+        out = wrapper.add_lora_linear(y, x, a_stacked, b_stacked, scale=1.0)
+
+        assert out.dtype == y.dtype
+
+
+def test_punica_rejects_routing_row_count_mismatch() -> None:
+    wrapper = punica_mod.PunicaWrapperMLX(
+        max_num_batched_tokens=2, max_batches=2, max_loras=1
+    )
+    wrapper.update_metadata(
+        LoRAMapping(index_mapping=(7, 7), prompt_mapping=(7,)),
+        lora_index_to_id=[7],
+    )
+
+    with pytest.raises(ValueError, match="LoRA routing row count mismatch"):
+        wrapper.add_lora_linear(
+            mx.zeros((1, 1), dtype=mx.float32),
+            mx.ones((1, 1), dtype=mx.float32),
+            mx.ones((1, 1, 1), dtype=mx.float32),
+            mx.ones((1, 1, 1), dtype=mx.float32),
+            scale=1.0,
+        )
+
+
 # MLXLinearWithLoRA wrapper
 
 
@@ -68,6 +191,18 @@ def test_linear_wrapper_set_lora_writes_into_correct_slot() -> None:
     np.testing.assert_array_equal(a_stacked[1, 2:, :], np.zeros((2, 3)))
     np.testing.assert_array_equal(b_stacked[1, :, :2], np.ones((4, 2)))
     np.testing.assert_array_equal(b_stacked[1, :, 2:], np.zeros((4, 2)))
+
+
+def test_linear_wrapper_rank_metadata_is_not_a_module_parameter() -> None:
+    wrapper = layers_mod.MLXLinearWithLoRA(
+        base_layer=nn.Linear(input_dims=3, output_dims=4, bias=False),
+        max_loras=2,
+        max_lora_rank=4,
+        dtype=mx.float32,
+    )
+
+    assert "lora_ranks" not in wrapper.parameters()
+    assert "_lora_ranks" not in wrapper.parameters()
 
 
 @pytest.mark.parametrize(
@@ -121,8 +256,8 @@ def test_linear_wrapper_call_with_active_lora_changes_output() -> None:
 # PEFT loader (round-trip through a tmp safetensors file)
 
 
-def _write_peft_adapter(tmp_path: Path) -> Path:
-    from safetensors.numpy import save_file
+def _write_peft_adapter(tmp_path: Path, *, dtype: torch.dtype = torch.float32) -> Path:
+    from safetensors.torch import save_file
 
     config = {
         "peft_type": "LORA",
@@ -133,8 +268,8 @@ def _write_peft_adapter(tmp_path: Path) -> Path:
         "use_rslora": False,
     }
     (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-    a = np.arange(6, dtype=np.float32).reshape(2, 3)
-    b = np.arange(8, dtype=np.float32).reshape(4, 2)
+    a = torch.arange(6, dtype=dtype).reshape(2, 3)
+    b = torch.arange(8, dtype=dtype).reshape(4, 2)
     save_file(
         {
             "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": a,
@@ -145,12 +280,19 @@ def _write_peft_adapter(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_peft_loader_normalizes_module_name_and_keeps_orientation(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "torch_dtype,mlx_dtype",
+    [
+        (torch.float32, mx.float32),
+        (torch.float16, mx.float16),
+        (torch.bfloat16, mx.bfloat16),
+    ],
+    ids=["float32", "float16", "bfloat16"],
+)
+def test_peft_loader_normalizes_module_name_and_preserves_weights(
+    tmp_path: Path, torch_dtype: torch.dtype, mlx_dtype: mx.Dtype
 ) -> None:
-    pytest.importorskip("safetensors.numpy")
-
-    adapter_dir = _write_peft_adapter(tmp_path)
+    adapter_dir = _write_peft_adapter(tmp_path, dtype=torch_dtype)
     loaded = peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=1)
 
     assert loaded.lora_id == 1
@@ -158,9 +300,38 @@ def test_peft_loader_normalizes_module_name_and_keeps_orientation(
     assert "layers.0.self_attn.q_proj" in loaded.weights
 
     weights = loaded.weights["layers.0.self_attn.q_proj"]
-    assert weights.lora_a.shape == (2, 3)
-    assert weights.lora_b.shape == (4, 2)
+    assert weights.lora_a.dtype == mlx_dtype
+    assert weights.lora_b.dtype == mlx_dtype
+    np.testing.assert_array_equal(
+        np.array(weights.lora_a.astype(mx.float32)), np.arange(6).reshape(2, 3)
+    )
+    np.testing.assert_array_equal(
+        np.array(weights.lora_b.astype(mx.float32)), np.arange(8).reshape(4, 2)
+    )
     assert weights.scaling == pytest.approx(4.0)
+
+
+def test_peft_loader_materializes_weights_before_return(tmp_path: Path) -> None:
+    from safetensors.torch import save
+
+    adapter_dir = _write_peft_adapter(tmp_path)
+    loaded = peft_loader_mod.load_peft_adapter(adapter_dir, lora_id=1)
+    replacement = save(
+        {
+            "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.zeros(
+                2, 3
+            ),
+            "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.zeros(
+                4, 2
+            ),
+        }
+    )
+    # Overwrite the same file: save_file atomically replaces it on some versions.
+    (adapter_dir / "adapter_model.safetensors").write_bytes(replacement)
+
+    weights = loaded.weights["layers.0.self_attn.q_proj"]
+    np.testing.assert_array_equal(np.array(weights.lora_a), np.arange(6).reshape(2, 3))
+    np.testing.assert_array_equal(np.array(weights.lora_b), np.arange(8).reshape(4, 2))
 
 
 @pytest.mark.parametrize(
@@ -263,10 +434,8 @@ def test_lookup_weights_for_module(stored_key, lookup, expected_hit) -> None:
 # Multi-adapter batching
 
 
-def _stack_with_null(*per_slot_a: np.ndarray) -> tuple[mx.array, int, int]:
-    """Stack rank-1 LoRA A weights into ``(slots+1, rank, in)`` with null tail."""
-    null = np.zeros_like(per_slot_a[0])
-    stacked = np.stack([*per_slot_a, null])
+def _stack_adapters(*per_slot_a: np.ndarray) -> tuple[mx.array, int, int]:
+    stacked = np.stack(per_slot_a)
     return mx.array(stacked), int(stacked.shape[1]), int(stacked.shape[2])
 
 
@@ -281,12 +450,11 @@ def test_punica_routes_two_adapters_in_one_batch() -> None:
 
     a0 = np.array([[1.0, 0.0]], dtype=np.float32)  # adapter 11 picks dim 0
     a1 = np.array([[0.0, 1.0]], dtype=np.float32)  # adapter 22 picks dim 1
-    a_stacked, _, _ = _stack_with_null(a0, a1)
+    a_stacked, _, _ = _stack_adapters(a0, a1)
 
     b0 = np.array([[1.0]], dtype=np.float32)  # adapter 11: out scale 1
     b1 = np.array([[10.0]], dtype=np.float32)  # adapter 22: out scale 10
-    b_null = np.zeros_like(b0)
-    b_stacked = mx.array(np.stack([b0, b1, b_null]))
+    b_stacked = mx.array(np.stack([b0, b1]))
 
     x = mx.array(
         np.array([[2.0, 3.0], [2.0, 3.0], [4.0, 5.0], [4.0, 5.0]], dtype=np.float32)
@@ -303,7 +471,7 @@ def test_punica_routes_two_adapters_in_one_batch() -> None:
 
 
 def test_punica_three_adapters_with_no_lora_token() -> None:
-    """Mixed batch: 3 adapters + a base-model token routed to the null slot."""
+    """Mixed batch: 3 adapters + one base-model token."""
     wrapper = punica_mod.PunicaWrapperMLX(
         max_num_batched_tokens=4, max_batches=4, max_loras=3
     )
@@ -311,10 +479,11 @@ def test_punica_three_adapters_with_no_lora_token() -> None:
     wrapper.update_metadata(mapping, lora_index_to_id=[7, 8, 9])
 
     # Three rank-1 adapters that each return a scalar = adapter index + 1.
-    a_stacked, _, _ = _stack_with_null(
+    a_stacked, _, _ = _stack_adapters(
         np.array([[1.0]], dtype=np.float32),
         np.array([[2.0]], dtype=np.float32),
         np.array([[3.0]], dtype=np.float32),
+        np.array([[0.0]], dtype=np.float32),
     )
     b_stacked = mx.array(
         np.stack(
@@ -322,7 +491,7 @@ def test_punica_three_adapters_with_no_lora_token() -> None:
                 np.array([[1.0]], dtype=np.float32),
                 np.array([[1.0]], dtype=np.float32),
                 np.array([[1.0]], dtype=np.float32),
-                np.array([[0.0]], dtype=np.float32),  # null slot
+                np.array([[0.0]], dtype=np.float32),
             ]
         )
     )
@@ -332,7 +501,7 @@ def test_punica_three_adapters_with_no_lora_token() -> None:
 
     out = np.array(wrapper.add_lora_linear(y, x, a_stacked, b_stacked, scale=1.0))
 
-    # Adapters add 1, 2, 0 (null), 3 to the base of 100.
+    # Adapters add 1, 2, 0 (no LoRA), 3 to the base of 100.
     np.testing.assert_allclose(out.flatten(), [101.0, 102.0, 100.0, 103.0], rtol=1e-5)
 
 
@@ -350,8 +519,8 @@ def test_punica_batched_matches_per_token_single_adapter_runs() -> None:
         rng.standard_normal((out_dim, rank)).astype(np.float32),
         rng.standard_normal((out_dim, rank)).astype(np.float32),
     )
-    a_stacked = mx.array(np.stack([a0, a1, np.zeros_like(a0)]))
-    b_stacked = mx.array(np.stack([b0, b1, np.zeros_like(b0)]))
+    a_stacked = mx.array(np.stack([a0, a1]))
+    b_stacked = mx.array(np.stack([b0, b1]))
 
     x_np = rng.standard_normal((4, in_dim)).astype(np.float32)
     x = mx.array(x_np)
@@ -388,13 +557,12 @@ def test_punica_update_metadata_reroutes_after_slot_churn() -> None:
     # Adapter 11 picks dim 0 (=> output 1), adapter 22 picks dim 1 (=> output 10).
     a0 = np.array([[1.0, 0.0]], dtype=np.float32)
     a1 = np.array([[0.0, 1.0]], dtype=np.float32)
-    a_stacked = mx.array(np.stack([a0, a1, np.zeros_like(a0)]))
+    a_stacked = mx.array(np.stack([a0, a1]))
     b_stacked = mx.array(
         np.stack(
             [
                 np.array([[1.0]], dtype=np.float32),
                 np.array([[10.0]], dtype=np.float32),
-                np.array([[0.0]], dtype=np.float32),
             ]
         )
     )
@@ -406,20 +574,18 @@ def test_punica_update_metadata_reroutes_after_slot_churn() -> None:
         LoRAMapping(index_mapping=(11, 11), prompt_mapping=(11,)),
         lora_index_to_id=[11, None],
     )
-    assert wrapper.token_slot_indices.tolist() == [0, 0]
     out1 = np.array(wrapper.add_lora_linear(y, x, a_stacked, b_stacked, scale=1.0))
     np.testing.assert_allclose(out1.flatten(), [1.0, 1.0], rtol=1e-5)
 
     # Step 2: adapter 11 moved to slot 1 (because slot 0 now holds 22). The
     # weight stack the manager passes also gets reordered: slot 0 = adapter 22's
     # weights, slot 1 = adapter 11's. Token 0 still requests adapter 11 -> slot 1.
-    a_stacked_swapped = mx.array(np.stack([a1, a0, np.zeros_like(a0)]))
+    a_stacked_swapped = mx.array(np.stack([a1, a0]))
     b_stacked_swapped = mx.array(
         np.stack(
             [
                 np.array([[10.0]], dtype=np.float32),
                 np.array([[1.0]], dtype=np.float32),
-                np.array([[0.0]], dtype=np.float32),
             ]
         )
     )
@@ -427,13 +593,9 @@ def test_punica_update_metadata_reroutes_after_slot_churn() -> None:
         LoRAMapping(index_mapping=(11, 22), prompt_mapping=(11, 22)),
         lora_index_to_id=[22, 11],
     )
-    assert wrapper.token_slot_indices.tolist() == [1, 0]
     out2 = np.array(
         wrapper.add_lora_linear(y, x, a_stacked_swapped, b_stacked_swapped, scale=1.0)
     )
-    # Token 0 (adapter 11, slot 1): a1·[1,1]=1, b·1=1.  No, wait — slot 1 holds adapter 11.
-    # a_swapped[1] = a0 = [1,0]; a0·[1,1] = 1; b_swapped[1] = [[1.0]]; -> 1.0.
-    # Token 1 (adapter 22, slot 0): a_swapped[0] = a1 = [0,1]; a1·[1,1] = 1; b_swapped[0] = [[10.0]]; -> 10.0.
     np.testing.assert_allclose(out2.flatten(), [1.0, 10.0], rtol=1e-5)
 
 
@@ -446,6 +608,7 @@ def _lora_config_stub(
     max_lora_rank: int,
     max_cpu_loras: int | None = None,
     target_modules: list[str] | None = None,
+    lora_dtype: torch.dtype = torch.float32,
 ) -> SimpleNamespace:
     """Stand-in for ``vllm.config.lora.LoRAConfig`` — only the fields the manager reads."""
     return SimpleNamespace(
@@ -453,6 +616,7 @@ def _lora_config_stub(
         max_lora_rank=max_lora_rank,
         max_cpu_loras=max_cpu_loras,
         target_modules=target_modules,
+        lora_dtype=lora_dtype,
     )
 
 
@@ -487,6 +651,22 @@ def _make_adapter(
             )
         },
     )
+
+
+def test_manager_rejects_cpu_capacity_below_resident_slots() -> None:
+    model = _TwoLinearModel()
+    with pytest.raises(ValueError, match="max_cpu_loras.*max_loras"):
+        model_manager_mod.MLXLoRAModelManager(
+            model=model,
+            lora_config=_lora_config_stub(
+                max_loras=2,
+                max_lora_rank=1,
+                max_cpu_loras=1,
+            ),
+            max_num_seqs=1,
+            max_num_batched_tokens=2,
+            dtype=mx.float32,
+        )
 
 
 def test_manager_wraps_linears_then_activate_applies_delta() -> None:
@@ -653,8 +833,8 @@ def test_manager_activate_invalidates_mapping_cache(monkeypatch) -> None:
     assert manager._last_mapping is None  # invalidated
 
 
-def test_manager_no_free_slot_raises() -> None:
-    """activate_adapter must raise once max_loras slots are full."""
+def test_manager_activation_evicts_lru_slot() -> None:
+    """Activating a cached adapter must replace the least-recent resident slot."""
     model = _TwoLinearModel()
     manager = model_manager_mod.MLXLoRAModelManager(
         model=model,
@@ -676,12 +856,14 @@ def test_manager_no_free_slot_raises() -> None:
     manager.add_adapter(a)
     manager.add_adapter(b)
     manager.activate_adapter(1)
-    with pytest.raises(ValueError, match="No free LoRA slots"):
-        manager.activate_adapter(2)
+    assert manager.activate_adapter(2) is True
+
+    assert manager.lora_index_to_id == [2]
+    assert manager.list_adapters() == {1, 2}
 
 
-def test_manager_add_adapter_over_capacity_raises() -> None:
-    """add_adapter must raise once max_cpu_loras adapters are registered."""
+def test_manager_add_adapter_evicts_lru_registered_adapter() -> None:
+    """The registered cache must evict its oldest unpinned adapter at capacity."""
     model = _TwoLinearModel()
     manager = model_manager_mod.MLXLoRAModelManager(
         model=model,
@@ -701,15 +883,16 @@ def test_manager_add_adapter_over_capacity_raises() -> None:
         fc1_b=np.array([[0.0], [1.0]], dtype=np.float32),
     )
     manager.add_adapter(a)
-    with pytest.raises(RuntimeError, match="capacity"):
-        manager.add_adapter(b)
+    assert manager.add_adapter(b) is True
+
+    assert manager.list_adapters() == {2}
 
 
-def test_manager_pin_tracks_existing_adapter_only() -> None:
+def test_manager_pin_prevents_lru_eviction() -> None:
     model = _TwoLinearModel()
     manager = model_manager_mod.MLXLoRAModelManager(
         model=model,
-        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1, max_cpu_loras=2),
+        lora_config=_lora_config_stub(max_loras=2, max_lora_rank=1, max_cpu_loras=2),
         max_num_seqs=1,
         max_num_batched_tokens=2,
         dtype=mx.float32,
@@ -721,9 +904,57 @@ def test_manager_pin_tracks_existing_adapter_only() -> None:
     )
     manager.add_adapter(adapter)
     assert manager.pin_adapter(7) is True
-    assert manager.pin_adapter(8) is False
-    assert manager.remove_adapter(7) is True
-    assert 7 not in manager.list_adapters()
+    with pytest.raises(ValueError, match="not registered"):
+        manager.pin_adapter(8)
+
+    manager.add_adapter(
+        _make_adapter(
+            8,
+            fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+            fc1_b=np.array([[2.0], [0.0]], dtype=np.float32),
+        )
+    )
+    manager.add_adapter(
+        _make_adapter(
+            9,
+            fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+            fc1_b=np.array([[3.0], [0.0]], dtype=np.float32),
+        )
+    )
+
+    assert manager.list_adapters() == {7, 9}
+
+
+def test_manager_all_pinned_cache_rejects_eviction_without_mutation() -> None:
+    model = _TwoLinearModel()
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=model,
+        lora_config=_lora_config_stub(max_loras=2, max_lora_rank=1, max_cpu_loras=2),
+        max_num_seqs=2,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    for lora_id in (1, 2):
+        manager.add_adapter(
+            _make_adapter(
+                lora_id,
+                fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+                fc1_b=np.array([[float(lora_id)], [0.0]], dtype=np.float32),
+            )
+        )
+        manager.pin_adapter(lora_id)
+
+    with pytest.raises(RuntimeError, match="pinned"):
+        manager.add_adapter(
+            _make_adapter(
+                3,
+                fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+                fc1_b=np.array([[3.0], [0.0]], dtype=np.float32),
+            )
+        )
+
+    assert manager.list_adapters() == {1, 2}
+    assert manager.lora_index_to_id == [1, 2]
 
 
 def test_manager_remove_all_adapters_clears_slots_and_registry() -> None:
@@ -890,7 +1121,6 @@ def _runtime_setup_kwargs(**overrides: object) -> dict:
         "speculative_decode_enabled": False,
         "max_num_seqs": 1,
         "max_num_batched_tokens": 8,
-        "dtype": mx.float16,
         "max_position_embeddings": None,
     }
     kwargs.update(overrides)
@@ -917,52 +1147,85 @@ def test_runtime_stt_disables_lora_without_raising() -> None:
     assert rt.enabled is False
 
 
-def test_prepare_step_raises_for_unloaded_lora_id() -> None:
+def test_runtime_uses_configured_lora_dtype() -> None:
+    model = _TwoLinearModel()
+    rt = runtime_mod.MetalLoRARuntime()
+
+    rt.setup(
+        **_runtime_setup_kwargs(
+            model=model,
+            lora_config=_lora_config_stub(
+                max_loras=1,
+                max_lora_rank=1,
+                lora_dtype=torch.bfloat16,
+                target_modules=["fc1"],
+            ),
+        )
+    )
+
+    assert model.fc1.lora_a_stacked.dtype == mx.bfloat16
+
+
+def test_prepare_step_raises_for_unknown_lora_id() -> None:
     rt = runtime_mod.MetalLoRARuntime()
     # Manager presence is all prepare_step checks before routing; the raise
     # fires in the routing loop before the manager is ever touched.
     rt._manager = SimpleNamespace(set_active_adapters=lambda *a, **k: None)
-    with pytest.raises(ValueError, match="LoRA id 7 was routed .* not "):
+    with pytest.raises(ValueError, match="LoRA id 7 was routed .* not known"):
         rt.prepare_step([(7, 1)])
 
 
 def test_prepare_step_marks_prefill_mapping() -> None:
-    class CapturingManager:
-        def __init__(self) -> None:
-            self.mapping = None
+    captured = {}
 
-        def set_active_adapters(self, lora_requests, mapping) -> None:
-            self.mapping = mapping
+    def capture_mapping(lora_requests, mapping) -> None:
+        captured["mapping"] = mapping
 
-    class Request:
-        pass
-
-    manager = CapturingManager()
     rt = runtime_mod.MetalLoRARuntime()
-    rt._manager = manager
-    rt._loaded[7] = Request()
+    rt._manager = SimpleNamespace(set_active_adapters=capture_mapping)
+    rt._requests_by_id[7] = object()
 
     rt.prepare_step([(7, 3)])
 
-    assert manager.mapping.index_mapping == (7, 7, 7)
-    assert manager.mapping.prompt_mapping == (7,)
-    assert manager.mapping.is_prefill is True
+    mapping = captured["mapping"]
+    assert mapping.index_mapping == (7, 7, 7)
+    assert mapping.prompt_mapping == (7,)
+    assert mapping.is_prefill is True
 
 
-def test_worker_manager_rejects_cpu_loras_gt_max_loras() -> None:
-    with pytest.raises(NotImplementedError, match="max_cpu_loras > max_loras"):
-        worker_manager_mod.MetalWorkerLoRAManager(
-            model=_TwoLinearModel(),
-            lora_config=_lora_config_stub(
-                max_loras=2, max_lora_rank=8, max_cpu_loras=4
-            ),
-            max_num_seqs=1,
-            max_num_batched_tokens=8,
-            dtype=mx.float32,
-        )
+def test_prepare_step_keeps_mixed_decode_prefill_on_decode_route() -> None:
+    captured = {}
+
+    def capture_mapping(lora_requests, mapping) -> None:
+        captured["mapping"] = mapping
+
+    rt = runtime_mod.MetalLoRARuntime()
+    rt._manager = SimpleNamespace(set_active_adapters=capture_mapping)
+    rt._requests_by_id[7] = object()
+    rt._requests_by_id[8] = object()
+
+    rt.prepare_step([(7, 1), (8, 3)])
+
+    mapping = captured["mapping"]
+    assert mapping.index_mapping == (7, 8, 8, 8)
+    assert mapping.prompt_mapping == (7, 8)
+    assert mapping.is_prefill is False
 
 
-def test_activate_adapter_rejects_zero_module_match() -> None:
+def test_worker_manager_supports_cpu_cache_larger_than_resident_slots() -> None:
+    manager = worker_manager_mod.MetalWorkerLoRAManager(
+        model=_TwoLinearModel(),
+        lora_config=_lora_config_stub(max_loras=2, max_lora_rank=8, max_cpu_loras=4),
+        max_num_seqs=1,
+        max_num_batched_tokens=8,
+        dtype=mx.float32,
+    )
+
+    assert manager._mm.capacity == 4
+    assert manager._mm.lora_slots == 2
+
+
+def test_add_adapter_rejects_zero_module_match_before_cache_mutation() -> None:
     model = _TwoLinearModel()
     manager = model_manager_mod.MLXLoRAModelManager(
         model=model,
@@ -985,14 +1248,13 @@ def test_activate_adapter_rejects_zero_module_match() -> None:
             )
         },
     )
-    manager.add_adapter(bogus)
     with pytest.raises(ValueError, match="matched 0 wrapped modules"):
-        manager.activate_adapter(1)
-    # Slot must be rolled back so a later valid activation can use it.
+        manager.add_adapter(bogus)
+    assert manager.list_adapters() == set()
     assert all(sid is None for sid in manager.lora_index_to_id)
 
 
-def test_activate_adapter_rejects_ambiguous_suffix_match() -> None:
+def test_add_adapter_rejects_ambiguous_suffix_match_before_cache_mutation() -> None:
     """If two adapter keys both suffix-match a wrapped module, fail loudly."""
     model = _TwoLinearModel()
     manager = model_manager_mod.MLXLoRAModelManager(
@@ -1022,14 +1284,18 @@ def test_activate_adapter_rejects_ambiguous_suffix_match() -> None:
             "fc2": _w("fc2"),
         },
     )
-    manager.add_adapter(ambiguous)
     with pytest.raises(ValueError, match="ambiguous suffix matches"):
-        manager.activate_adapter(42)
+        manager.add_adapter(ambiguous)
+    assert manager.list_adapters() == set()
     assert all(sid is None for sid in manager.lora_index_to_id)
 
 
-def _stub_lora_request(lora_id: int, *, load_inplace: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(
+class _StubLoRARequest(SimpleNamespace):
+    __hash__ = object.__hash__
+
+
+def _stub_lora_request(lora_id: int, *, load_inplace: bool = False) -> _StubLoRARequest:
+    return _StubLoRARequest(
         lora_int_id=lora_id,
         lora_path=f"/fake/adapter-{lora_id}",
         load_inplace=load_inplace,
@@ -1081,6 +1347,92 @@ def test_worker_manager_empty_batch_deactivates_stale_adapters(monkeypatch) -> N
     assert all(sid is None for sid in manager._mm.lora_index_to_id)
 
 
+def test_worker_manager_keeps_pinned_adapter_resident(monkeypatch) -> None:
+    manager = _make_worker_manager()
+    _patch_loader(
+        monkeypatch,
+        {
+            lora_id: _make_adapter(
+                lora_id,
+                fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+                fc1_b=np.array([[float(lora_id)], [0.0]], dtype=np.float32),
+            )
+            for lora_id in (1, 2)
+        },
+    )
+
+    assert manager.add_adapter(_stub_lora_request(1)) is True
+    assert manager.pin_adapter(1) is True
+
+    manager.set_active_adapters(set(), None)
+    manager.set_active_adapters({_stub_lora_request(2)}, None)
+
+    assert manager._mm.lora_index_to_id == [1, 2]
+
+
+def test_worker_manager_evicts_between_sequential_adapters(monkeypatch) -> None:
+    """The default one-entry cache must serve more than one adapter over time."""
+    manager = worker_manager_mod.MetalWorkerLoRAManager(
+        model=_TwoLinearModel(),
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1, max_cpu_loras=1),
+        max_num_seqs=1,
+        max_num_batched_tokens=2,
+        dtype=mx.float32,
+    )
+    adapters = {
+        lora_id: _make_adapter(
+            lora_id,
+            fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+            fc1_b=np.array([[float(lora_id)], [0.0]], dtype=np.float32),
+        )
+        for lora_id in (1, 2)
+    }
+    _patch_loader(monkeypatch, adapters)
+
+    assert manager.add_adapter(_stub_lora_request(1)) is True
+    manager.set_active_adapters(set(), None)
+    assert manager.add_adapter(_stub_lora_request(2)) is True
+
+    assert manager.list_adapters() == {2}
+    assert manager._mm.lora_index_to_id == [2]
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 2), [2.0, 0.0])
+
+
+def test_worker_manager_reloads_requested_adapter_after_cache_eviction(
+    monkeypatch,
+) -> None:
+    manager = worker_manager_mod.MetalWorkerLoRAManager(
+        model=_TwoLinearModel(),
+        lora_config=_lora_config_stub(max_loras=2, max_lora_rank=1, max_cpu_loras=2),
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        dtype=mx.float32,
+    )
+    adapters = {
+        lora_id: _make_adapter(
+            lora_id,
+            fc1_a=np.array([[1.0, 0.0]], dtype=np.float32),
+            fc1_b=np.array([[float(lora_id)], [0.0]], dtype=np.float32),
+        )
+        for lora_id in (1, 2, 3)
+    }
+    _patch_loader(monkeypatch, adapters)
+
+    request_1 = _stub_lora_request(1)
+    request_2 = _stub_lora_request(2)
+    request_3 = _stub_lora_request(3)
+    manager.add_adapter(request_1)
+    manager.add_adapter(request_2)
+    manager.set_active_adapters({request_1, request_2}, None)
+
+    manager.add_adapter(request_3)
+    manager.set_active_adapters({request_1, request_3}, None)
+
+    assert set(manager._mm.lora_index_to_id) == {1, 3}
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 1), [1.0, 0.0])
+    np.testing.assert_array_equal(_active_fc1_lora_b(manager, 3), [3.0, 0.0])
+
+
 def test_worker_manager_add_adapter_load_inplace_replaces_weights(monkeypatch) -> None:
     """Re-adding the same lora_int_id with load_inplace=True must swap weights."""
     manager = _make_worker_manager()
@@ -1100,8 +1452,8 @@ def test_worker_manager_add_adapter_load_inplace_replaces_weights(monkeypatch) -
     assert manager.add_adapter(_stub_lora_request(7)) is True
     np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [3.0, 0.0])
 
-    # Without load_inplace, the duplicate add is a no-op.
-    assert manager.add_adapter(_stub_lora_request(7)) is False
+    # Without load_inplace, the duplicate add is an idempotent success.
+    assert manager.add_adapter(_stub_lora_request(7)) is True
 
     # With load_inplace=True, the new weights must replace the old in the slot.
     state[7] = v2

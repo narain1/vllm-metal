@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -154,6 +155,31 @@ class TestMetalPagedKVCachePerLayer:
                 kv_heads_per_layer=[8, 8, 8],
             )
 
+    def test_heterogeneous_dense_log_reports_per_layer_bytes(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """E4B-shaped unique layers log 2.8 MB, not the old all-512 4.7 MB."""
+        head_dims = [512 if (index + 1) % 6 == 0 else 256 for index in range(24)]
+        with caplog.at_level(logging.INFO):
+            MetalPagedKVCache(
+                num_layers=24,
+                num_kv_heads=2,
+                head_dim=512,
+                num_blocks=3,
+                block_size=16,
+                dtype=mx.bfloat16,
+                kv_heads_per_layer=[2] * 24,
+                head_dim_per_layer=head_dims,
+            )
+        messages = [
+            record.message
+            for record in caplog.records
+            if record.message.startswith("KV cache:")
+        ]
+        assert len(messages) == 1, messages
+        assert "KV cache: 2.8 MB" in messages[0]
+        assert "4.7 MB" not in messages[0]
+
 
 class TestMHABackendPerLayer:
     """MHAPagedAttentionRuntime passes per-layer shapes to cache."""
@@ -193,10 +219,10 @@ class TestCachePolicyPerLayerBytes:
         head_dim: int,
         kv_heads_per_layer: list[int] | None = None,
         head_dim_per_layer: list[int] | None = None,
-        model_args: dict | None = None,
+        is_hybrid: bool = False,
     ) -> object:
         return make_stub_runner(
-            model_args=model_args,
+            is_hybrid=is_hybrid,
             num_layers=num_layers,
             num_kv_cache_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -262,7 +288,7 @@ class TestCachePolicyPerLayerBytes:
             head_dim=256,
             kv_heads_per_layer=[4, 4, 4, 4],
             head_dim_per_layer=[256, 256, 256, 256],
-            model_args={"full_attention_interval": 2},
+            is_hybrid=True,
         )
 
         with pytest.raises(

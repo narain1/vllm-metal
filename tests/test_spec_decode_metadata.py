@@ -209,7 +209,7 @@ class TestSpecDecodePolicy:
             )
 
     def test_hybrid_scheduled_tokens_are_rejected(self) -> None:
-        with pytest.raises(NotImplementedError, match="hybrid GDN"):
+        with pytest.raises(NotImplementedError, match="hybrid models"):
             SpeculativeDecodeController().validate_supported(
                 _scheduler_output(scheduled_spec_decode_tokens={"r0": [1]}),
                 [("r0", _request_state())],
@@ -356,6 +356,16 @@ class TestGemma4MTPDraftSeeds:
 
 
 class TestVerifyGreedySpecDecode:
+    def test_specific_token_logprobs_are_not_draft_eligible(self) -> None:
+        state = SimpleNamespace(
+            sampling_params=SamplingParams(
+                temperature=0.0,
+                logprob_token_ids=[0, 3],
+            )
+        )
+
+        assert not SpeculativeDecodeController().can_draft_greedy("r0", state)
+
     def test_accepts_all_drafts_and_emits_bonus_token(self) -> None:
         segment = PagedDecodeSegment(
             req_id="r0",

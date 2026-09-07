@@ -2,6 +2,7 @@
 """Tests for Metal platform."""
 
 import importlib
+import os
 import platform
 import sys
 from types import ModuleType, SimpleNamespace
@@ -24,10 +25,26 @@ from vllm.v1.kv_cache_interface import (
 )
 
 import vllm_metal.compat as compat
+import vllm_metal.config as vm_config
+import vllm_metal.platform as platform_module
 from tests.stub_runner import make_gemma4_mixed_mha_runner
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mb_buffer_default(monkeypatch):
+    """``check_and_update_config`` installs an env default when the machine
+    qualifies; snapshot/restore it so unrelated tests cannot leak it into
+    the session, and reset the plugin-ownership marker."""
+    saved = os.environ.get("MLX_MAX_MB_PER_BUFFER")
+    monkeypatch.setattr(MetalPlatform, "_mb_default_installed", None)
+    yield
+    if saved is None:
+        os.environ.pop("MLX_MAX_MB_PER_BUFFER", None)
+    else:
+        os.environ["MLX_MAX_MB_PER_BUFFER"] = saved
 
 
 class TestMetalPlatform:
@@ -1081,6 +1098,8 @@ class TestMetalPlatform:
         self,
         cache_config: SimpleNamespace,
         speculative_config: SimpleNamespace | None = None,
+        model_type: str = "qwen3_5",
+        text_model_type: str | None = None,
     ) -> VllmConfig:
         return self._platform_config(
             speculative_config=speculative_config,
@@ -1099,7 +1118,10 @@ class TestMetalPlatform:
                 tokenizer=None,
                 max_model_len=32768,
                 multimodal_config=None,
-                hf_config=SimpleNamespace(model_type="qwen3"),
+                hf_config=SimpleNamespace(model_type=model_type),
+                hf_text_config=SimpleNamespace(
+                    model_type=text_model_type or model_type
+                ),
                 is_hybrid=True,
             ),
             scheduler_config=SimpleNamespace(
@@ -1111,67 +1133,231 @@ class TestMetalPlatform:
             ),
         )
 
-    @pytest.mark.parametrize(
-        "paged,cache_config,speculative,err_match",
-        [
-            (
-                "0",
+    def test_check_and_update_config_disables_async_scheduling_for_spec_decode(
+        self,
+    ) -> None:
+        """Async scheduling downgrades to synchronous when SD is configured.
+
+        vLLM 0.28.0 auto-enables async scheduling for draft-model SD
+        (vllm#48341) before the platform hook runs; Metal proposers hand
+        drafts back synchronously via take_draft_token_ids().
+        """
+        vllm_config = self._platform_config(
+            speculative_config=SimpleNamespace(
+                use_heterogeneous_vocab=False,
+                num_speculative_tokens=3,
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.async_scheduling is False
+
+    @pytest.mark.parametrize("paged", ["0", "1"])
+    def test_check_and_update_config_rejects_hybrid_all_cache_mode(
+        self, paged: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """mamba_cache_mode='all' fails fast on every path, before downgrades."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", paged)
+        reset_config()
+        try:
+            # enable_prefix_caching=True so the non-paged parametrization also
+            # pins that the raise fires BEFORE the APC downgrade overwrites
+            # the mode.
+            vllm_config = self._hybrid_vllm_config(
                 SimpleNamespace(
                     block_size=None,
                     kv_cache_dtype_skip_layers=[],
                     enable_prefix_caching=True,
-                    mamba_cache_mode="none",
-                    mamba_ssm_cache_dtype="float32",
-                ),
-                None,
-                "requires paged",
-            ),
-            (
-                "1",
-                SimpleNamespace(
-                    block_size=None,
-                    kv_cache_dtype_skip_layers=[],
-                    enable_prefix_caching=False,
                     mamba_cache_mode="all",
                     mamba_ssm_cache_dtype="float32",
                 ),
-                None,
-                "mamba_cache_mode='all'",
-            ),
+            )
+            with pytest.raises(NotImplementedError, match="mamba_cache_mode='all'"):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    @pytest.mark.parametrize(
+        "paged,speculative",
+        [
+            ("0", None),
             (
                 "1",
-                SimpleNamespace(
-                    block_size=None,
-                    kv_cache_dtype_skip_layers=[],
-                    enable_prefix_caching=True,
-                    mamba_cache_mode="align",
-                    mamba_ssm_cache_dtype="float32",
-                ),
                 SimpleNamespace(
                     use_heterogeneous_vocab=False,
                     num_speculative_tokens=2,
                 ),
-                "speculative decoding",
             ),
         ],
-        ids=["prefix_caching_non_paged", "mamba_cache_mode_all", "prefix_and_sd"],
+        ids=["non_paged", "speculative_decoding"],
     )
-    def test_check_and_update_config_rejects_unsupported_hybrid_cache_modes(
+    def test_check_and_update_config_downgrades_default_hybrid_prefix_caching(
         self,
         paged: str,
-        cache_config: SimpleNamespace,
         speculative: SimpleNamespace | None,
-        err_match: str,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Hybrid combinations Metal cannot serve downgrade APC, not reject.
+
+        vLLM 0.28.0 enables prefix caching by default for hybrid models and
+        resolves mamba_cache_mode='align' / mamba_block_size=block_size before
+        the platform hook runs; failing here would fail every default launch.
+        The downgrade restores the upstream APC-off resolution.
+        """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", paged)
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
-                cache_config, speculative_config=speculative
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                speculative_config=speculative,
             )
-            with pytest.raises(NotImplementedError, match=err_match):
+            # Upstream resolves mamba_block_size = block_size AFTER CacheConfig
+            # construction (models/config.py), so user_specified stays False.
+            vllm_config.cache_config.mamba_block_size = 16
+            assert vllm_config.cache_config.user_specified_mamba_block_size is False
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        cache_config = vllm_config.cache_config
+        assert cache_config.enable_prefix_caching is False
+        assert cache_config.mamba_cache_mode == "none"
+        assert cache_config.mamba_block_size == 32768
+
+    def test_hybrid_prefix_caching_downgrade_rejects_user_mamba_block_size(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit --mamba-block-size fails fast when APC must be downgraded.
+
+        Once the hook disables prefix caching, upstream's
+        validate_mamba_block_size (an after-validator) would reject the kept
+        value with a misleading message; the Metal constraint wins instead.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_block_size=64,
+                    mamba_ssm_cache_dtype="float32",
+                ),
+            )
+            assert vllm_config.cache_config.user_specified_mamba_block_size is True
+            with pytest.raises(NotImplementedError, match="mamba-block-size"):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_downgrades_prefix_caching_for_slot_keyed_families(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                model_type="nemotron_h",
+            )
+            vllm_config.cache_config.mamba_block_size = 16
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        cache_config = vllm_config.cache_config
+        assert cache_config.enable_prefix_caching is False
+        assert cache_config.mamba_cache_mode == "none"
+        assert cache_config.mamba_block_size == 32768
+
+    def test_non_paged_hybrid_without_a_family_still_downgrades(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "0")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                model_type="falcon_h1",
+            )
+            vllm_config.cache_config.mamba_block_size = 16
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert vllm_config.cache_config.enable_prefix_caching is False
+
+    def test_hybrid_family_lookup_uses_the_text_model_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                model_type="falcon_h1",
+                text_model_type="nemotron_h",
+            )
+            vllm_config.cache_config.mamba_block_size = 16
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert vllm_config.cache_config.enable_prefix_caching is False
+        assert vllm_config.cache_config.mamba_cache_mode == "none"
+
+    def test_check_and_update_config_rejects_paged_hybrid_without_a_family(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                model_type="falcon_h1",
+            )
+            with pytest.raises(NotImplementedError, match="model_type='falcon_h1'"):
                 MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()
@@ -1196,6 +1382,10 @@ class TestMetalPlatform:
             MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()
+
+        cache_config = vllm_config.cache_config
+        assert cache_config.enable_prefix_caching is True
+        assert cache_config.mamba_cache_mode == "align"
 
     @pytest.mark.parametrize(
         ("dtype", "reject"),
@@ -1533,6 +1723,112 @@ class TestMetalPlatform:
 
         MetalPlatform.synchronize()
         assert called is True
+
+    def test_check_and_update_config_installs_mb_default_after_resolution(
+        self, monkeypatch
+    ) -> None:
+        """Threading + ordering pin: the public hook installs the MB default,
+        and the allowlist sees the RESOLVED executor backend (the config
+        enters with the unset default and resolves to "uni" in the same
+        call)."""
+        monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
+        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
+        vm_config.reset_config()
+        monkeypatch.setattr(
+            platform_module.psutil,
+            "virtual_memory",
+            lambda: SimpleNamespace(total=128 * (1 << 30), available=100 * (1 << 30)),
+        )
+        vllm_config = self._platform_config(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048, max_num_seqs=8
+            ),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.parallel_config.distributed_executor_backend == "uni"
+        assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "2000"
+        vm_config.reset_config()
+
+    def test_check_and_update_config_skips_mb_default_off_allowlist(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
+        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
+        vm_config.reset_config()
+        monkeypatch.setattr(
+            platform_module.psutil,
+            "virtual_memory",
+            lambda: SimpleNamespace(total=128 * (1 << 30), available=100 * (1 << 30)),
+        )
+        vllm_config = self._platform_config(
+            parallel_config=SimpleNamespace(
+                distributed_executor_backend="external_launcher"
+            ),
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048, max_num_seqs=8
+            ),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
+        vm_config.reset_config()
+
+    def test_check_and_update_config_keeps_manual_mb_export(self, monkeypatch) -> None:
+        monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "64")
+        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
+        vm_config.reset_config()
+        monkeypatch.setattr(
+            platform_module.psutil,
+            "virtual_memory",
+            lambda: SimpleNamespace(total=128 * (1 << 30), available=100 * (1 << 30)),
+        )
+        vllm_config = self._platform_config(
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=2048, max_num_seqs=8
+            ),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert os.environ["MLX_MAX_MB_PER_BUFFER"] == "64"
+        vm_config.reset_config()
+
+    def test_check_and_update_config_large_batch_clears_plugin_default(
+        self, monkeypatch
+    ) -> None:
+        """#585 shape: a later engine above the batched-token bound removes
+        the plugin's own earlier default instead of inheriting it."""
+        monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
+        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
+        vm_config.reset_config()
+        monkeypatch.setattr(
+            platform_module.psutil,
+            "virtual_memory",
+            lambda: SimpleNamespace(total=128 * (1 << 30), available=100 * (1 << 30)),
+        )
+
+        MetalPlatform.check_and_update_config(
+            self._platform_config(
+                scheduler_config=SimpleNamespace(
+                    max_num_batched_tokens=2048, max_num_seqs=8
+                ),
+            )
+        )
+        installed = os.environ.get("MLX_MAX_MB_PER_BUFFER")
+        MetalPlatform.check_and_update_config(
+            self._platform_config(
+                scheduler_config=SimpleNamespace(
+                    max_num_batched_tokens=8192, max_num_seqs=8
+                ),
+            )
+        )
+
+        assert installed == "2000"
+        assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
+        vm_config.reset_config()
 
 
 class TestKvBudgetBytes:

@@ -11,7 +11,9 @@ import pytest
 
 pytest.importorskip("vllm", reason="vllm not installed")
 
-from tests.stub_runner import make_stub_runner  # noqa: E402
+from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner  # noqa: E402
+from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
+from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
@@ -25,7 +27,11 @@ from vllm_metal.v1.worker import MetalWorker  # noqa: E402
 def _make_worker(model_runner: object, *, use_paged_attention: bool) -> MetalWorker:
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
-    worker.metal_config = SimpleNamespace(use_paged_attention=use_paged_attention)
+    worker.metal_config = MetalConfig(
+        memory_fraction=AUTO_MEMORY_FRACTION,
+        mlx_device="gpu",
+        use_paged_attention=use_paged_attention,
+    )
     worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
@@ -83,7 +89,7 @@ class TestWorkerRunnerBoundaryDelegation:
         worker.get_cache_block_size_bytes.assert_called_once_with()
 
     def test_determine_available_memory_single_sequence_mode(self) -> None:
-        """Test MLX path returns one max-length sequence estimate (PR #229)."""
+        """MLX path budgets one sequence plus vLLM's reserved null block."""
         model_runner = make_stub_runner(
             num_layers=16,
             num_kv_cache_layers=16,
@@ -95,14 +101,15 @@ class TestWorkerRunnerBoundaryDelegation:
             return_value="single_sequence_estimate"
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
+        model_runner.cache_config.block_size = worker.cache_config.block_size
         worker.model_config = SimpleNamespace(max_model_len=2048)
 
         try:
             available = MetalWorker.determine_available_memory(worker)
 
-            # Should return one max-length sequence KV cache bytes
-            # 2 (K+V) * 16 layers * 2048 tokens * 8 heads * 128 head_dim * 2 bytes
-            expected = 2 * 16 * 2048 * 8 * 128 * 2
+            # Request: 2048 tokens. Reserved null block: 16 tokens.
+            bytes_per_token = 2 * 16 * 8 * 128 * 2
+            expected = bytes_per_token * (2048 + 16)
             assert available == expected
         finally:
             pass
@@ -134,17 +141,19 @@ class TestOneSequenceKvBytes:
 
     def test_hybrid_adds_linear_state(self) -> None:
         model_runner = make_stub_runner(
-            model_args={"full_attention_interval": 2},
-            num_sdpa_layers=8,
+            is_hybrid=True,
             num_kv_heads=4,
             head_dim=256,
             kv_cache_dtype=mx.float16,
-            linear_conv_kernel_dim=3,
-            linear_conv_dim=5,
-            linear_num_v_heads=2,
-            linear_value_head_dim=7,
-            linear_key_head_dim=11,
-            num_linear_layers=3,
+            hybrid_runtime_plan=make_gdn_hybrid_plan(
+                12,
+                [0, 4, 8],
+                conv_kernel_dim=3,
+                conv_dim=5,
+                num_v_heads=2,
+                value_head_dim=7,
+                key_head_dim=11,
+            ),
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
         worker.model_config = SimpleNamespace(max_model_len=2048)
@@ -156,10 +165,10 @@ class TestOneSequenceKvBytes:
         result = MetalWorker._one_sequence_kv_bytes(worker)
 
         # Assert — SDPA bytes + linear state
-        sdpa_bytes = 2 * 8 * 2048 * 4 * 256 * 2
+        sdpa_bytes = 2 * 3 * 2048 * 4 * 256 * 2
         conv_bytes = (3 - 1) * 5 * mx.float16.size
         recurrent_bytes = 2 * 7 * 11 * mx.float32.size
-        linear_bytes = 3 * (conv_bytes + recurrent_bytes)
+        linear_bytes = 9 * (conv_bytes + recurrent_bytes)
         assert result == sdpa_bytes + linear_bytes
 
     def test_hybrid_uses_padded_mamba_page_size_when_set(self) -> None:
@@ -169,17 +178,19 @@ class TestOneSequenceKvBytes:
         # sequence falls short by the padding on every linear layer.
         padded_page = 4096
         model_runner = make_stub_runner(
-            model_args={"full_attention_interval": 2},
-            num_sdpa_layers=8,
+            is_hybrid=True,
             num_kv_heads=4,
             head_dim=256,
             kv_cache_dtype=mx.float16,
-            linear_conv_kernel_dim=3,
-            linear_conv_dim=5,
-            linear_num_v_heads=2,
-            linear_value_head_dim=7,
-            linear_key_head_dim=11,
-            num_linear_layers=3,
+            hybrid_runtime_plan=make_gdn_hybrid_plan(
+                12,
+                [0, 4, 8],
+                conv_kernel_dim=3,
+                conv_dim=5,
+                num_v_heads=2,
+                value_head_dim=7,
+                key_head_dim=11,
+            ),
             cache_config=SimpleNamespace(mamba_page_size_padded=padded_page),
         )
         worker = _make_worker(model_runner, use_paged_attention=False)
@@ -192,34 +203,28 @@ class TestOneSequenceKvBytes:
         result = MetalWorker._one_sequence_kv_bytes(worker)
 
         # Assert — SDPA bytes + padded linear pages (not raw state bytes)
-        sdpa_bytes = 2 * 8 * 2048 * 4 * 256 * 2
-        assert result == sdpa_bytes + 3 * padded_page
+        sdpa_bytes = 2 * 3 * 2048 * 4 * 256 * 2
+        assert result == sdpa_bytes + 9 * padded_page
 
     def test_linear_cache_bytes_uses_float32_recurrent(self) -> None:
         runner = mr.MetalModelRunner.__new__(mr.MetalModelRunner)
-        runner.model_args = {"full_attention_interval": 2}
+        runner.model_config = SimpleNamespace(is_hybrid=True)
         runner._model_adapter = DefaultModelAdapter()
         runner._cache_policy = ModelCachePolicy(runner, runner._model_adapter)
         runner.kv_cache_dtype = mx.float16
-        runner.linear_conv_kernel_dim = 3
-        runner.linear_conv_dim = 5
-        runner.linear_num_v_heads = 2
-        runner.linear_value_head_dim = 7
-        runner.linear_key_head_dim = 11
-        runner.num_linear_layers = 3
+        runner.hybrid_runtime_plan = make_gdn_hybrid_plan(
+            11,
+            range(8),
+            conv_kernel_dim=3,
+            conv_dim=5,
+            num_v_heads=2,
+            value_head_dim=7,
+            key_head_dim=11,
+        )
 
-        conv_bytes = (
-            (runner.linear_conv_kernel_dim - 1)
-            * runner.linear_conv_dim
-            * mx.float16.size
-        )
-        recurrent_bytes = (
-            runner.linear_num_v_heads
-            * runner.linear_value_head_dim
-            * runner.linear_key_head_dim
-            * mx.float32.size
-        )
-        expected = runner.num_linear_layers * (conv_bytes + recurrent_bytes)
+        # Hand-written from the plan above: conv (3-1)*5 fp16 values = 20 B,
+        # recurrent 2*7*11 fp32 values = 616 B, over 3 state layers.
+        expected = 3 * (20 + 616)
 
         assert runner.linear_cache_bytes_per_slot() == expected
 
@@ -312,7 +317,6 @@ class TestPagedAttentionPlanDiagnostics:
     ) -> WorkerCachePlanner:
         worker = _make_worker(model_runner, use_paged_attention=True)
         worker.cache_config.block_size = block_size
-        worker.metal_config.is_auto_memory = False
         worker.metal_config.memory_fraction = memory_fraction
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
         return WorkerCachePlanner(worker)
@@ -328,9 +332,9 @@ class TestPagedAttentionPlanDiagnostics:
             scheduler_config=SimpleNamespace(max_num_seqs=2),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         worker = _make_worker(runner, use_paged_attention=True)
-        worker.metal_config.is_auto_memory = False
         worker.metal_config.memory_fraction = 0.5
         worker.get_cache_block_size_bytes = MagicMock(return_value=1)
         monkeypatch.setattr(
@@ -368,6 +372,7 @@ class TestPagedAttentionPlanDiagnostics:
             scheduler_config=SimpleNamespace(max_num_seqs=256),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -409,6 +414,7 @@ class TestPagedAttentionPlanDiagnostics:
             scheduler_config=SimpleNamespace(max_num_seqs=1),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -438,12 +444,11 @@ class TestPagedAttentionPlanDiagnostics:
         runner = SimpleNamespace(
             is_hybrid=True,
             cache_config=SimpleNamespace(mamba_cache_mode="align"),
-            num_layers=24,
-            sdpa_layer_indices=list(range(6)),
-            # 18 logical GDN layers at 100 bytes per layer/slot. Striping
-            # produces six physical pools: 600 steady bytes per block plus
-            # one 100-byte old pool retained during growth.
-            linear_cache_bytes_per_slot=MagicMock(return_value=1_800),
+            # Six striped pools: 600 steady bytes per block plus one 100-byte
+            # old pool retained during growth.
+            hybrid_align_state_bytes_per_block=MagicMock(return_value=600),
+            hybrid_align_growth_bytes_per_block=MagicMock(return_value=100),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -472,7 +477,10 @@ class TestPagedAttentionPlanDiagnostics:
         assert plan.num_blocks == 10
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
-        runner = SimpleNamespace(is_hybrid=False)
+        runner = SimpleNamespace(
+            is_hybrid=False,
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
         planner = self._make_planner(runner, memory_fraction=0.1)
         monkeypatch.setattr(
             WorkerCachePlanner,
@@ -512,10 +520,56 @@ class TestPagedAttentionPlanDiagnostics:
         worker = _make_worker(
             SimpleNamespace(is_hybrid=False), use_paged_attention=True
         )
-        worker.metal_config.is_auto_memory = is_auto
-        worker.metal_config.memory_fraction = memory_fraction
+        worker.metal_config.memory_fraction = (
+            AUTO_MEMORY_FRACTION if is_auto else memory_fraction
+        )
         worker.cache_config.gpu_memory_utilization = gpu_mem_util
 
         fraction = WorkerCachePlanner(worker)._memory_fraction()
 
         assert fraction == expected_fraction
+
+
+class TestAlignStateSizing:
+    @staticmethod
+    def _make_align_runner() -> mr.MetalModelRunner:
+        """Qwen-shaped 24-layer GDN plan: 18 state layers striped over 6 SDPA."""
+        return make_stub_runner(
+            is_hybrid=True,
+            kv_cache_dtype=mx.float16,
+            hybrid_runtime_plan=build_gdn_hybrid_plan(
+                {
+                    "full_attention_interval": 4,
+                    "linear_num_key_heads": 1,
+                    "linear_num_value_heads": 1,
+                    "linear_key_head_dim": 1,
+                    "linear_value_head_dim": 1,
+                    "linear_conv_kernel_dim": 2,
+                },
+                24,
+            ),
+        )
+
+    def test_align_state_bytes_per_block_stripes_pools(self) -> None:
+        runner = self._make_align_runner()
+        # Hand-written: conv (2-1)*3 fp16 values = 6 B plus 1*1*1 fp32 = 4 B
+        # per layer, one pool per SDPA layer -> 10 B * 6 pools.
+        expected = 60
+
+        assert runner.hybrid_align_state_bytes_per_block() == expected
+
+    def test_align_growth_bytes_retain_one_pool(self) -> None:
+        runner = self._make_align_runner()
+        # Hand-written: one old pool holds one layer's 10 B.
+        expected = 10
+
+        assert runner.hybrid_align_growth_bytes_per_block() == expected
+
+
+class TestHybridPlanGuard:
+    def test_hybrid_sizing_without_plan_rejects(self) -> None:
+        # The typed config says hybrid; the stub leaves the plan at None.
+        runner = make_stub_runner(is_hybrid=True)
+
+        with pytest.raises(RuntimeError, match="no resolved hybrid_runtime_plan"):
+            runner.linear_cache_bytes_per_slot()

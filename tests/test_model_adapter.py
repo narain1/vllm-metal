@@ -59,15 +59,15 @@ class TestShouldForceTextBackbone:
     @pytest.mark.parametrize(
         ("model_type", "architecture"),
         [
-            # Dense and MoE MLX 4-bit wrappers from issues #580 and #571.
+            # Only the dense Qwen3.5 wrapper has a native multimodal adapter.
             ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
-            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
-            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
         ],
     )
-    def test_mlx_quant_conditional_generation_uses_auto_override(
+    def test_mlx_quant_conditional_generation_keeps_native_path(
         self, model_type: str, architecture: str, bits: int
     ) -> None:
+        # mlx-vlm >=0.6.8 drives these wrappers with correct mRoPE state, so
+        # the auto-mode override no longer routes them to the text backbone.
         hf_config = SimpleNamespace(
             model_type=model_type,
             architectures=[architecture],
@@ -75,7 +75,29 @@ class TestShouldForceTextBackbone:
         )
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(hf_config)
-        assert result is True
+        assert result is False
+
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
+            ("qwen3_6_moe", "Qwen3_6MoeForConditionalGeneration"),
+        ],
+    )
+    def test_mlx_quant_wrapper_without_adapter_keeps_text_backbone(
+        self, model_type: str, architecture: str
+    ) -> None:
+        # `build_multimodal_adapter` has no adapter for these, and an image
+        # request against a missing adapter raises in the runner.
+        hf_config = SimpleNamespace(
+            model_type=model_type,
+            architectures=[architecture],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.should_force_text_backbone(hf_config) is True
+        assert adapter.build_multimodal_adapter(object(), hf_config) is None
 
     @pytest.mark.parametrize(
         ("model_type", "architecture", "vision_config"),
@@ -105,7 +127,7 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is False
 
-    def test_mlx_quant_qwen35_wrapper_uses_auto_override_with_vision_config(
+    def test_mlx_quant_qwen35_wrapper_keeps_native_path_with_vision_config(
         self,
     ) -> None:
         hf_config = SimpleNamespace(
@@ -117,7 +139,7 @@ class TestShouldForceTextBackbone:
         )
         adapter = DefaultModelAdapter()
         result = adapter.should_force_text_backbone(hf_config)
-        assert result is True
+        assert result is False
 
     def test_multimodal_native_mode_disables_mlx_quant_override(
         self, monkeypatch
@@ -326,6 +348,144 @@ class TestTargetForward:
         assert output.hidden_states.tolist() == [[2.0, 3.0]]
         assert output.logits.tolist() == [[[6.0, 7.0]]]
 
+    def test_selective_logits_match_the_full_projection_rows(self) -> None:
+        # The head must see only the requested rows, and the result must equal
+        # those rows of the full projection.
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]])
+
+        class Head:
+            def __init__(self) -> None:
+                self.seen_rows: int | None = None
+
+            def __call__(self, hidden_states):
+                self.seen_rows = hidden_states.shape[-2]
+                return hidden_states * 3.0
+
+        head = Head()
+        model = SimpleNamespace(
+            model=Backbone(), lm_head=head, final_logit_softcapping=None
+        )
+        adapter = DefaultModelAdapter()
+
+        full = adapter.target_forward(
+            model, mx.array([[1, 2, 3, 4]]), cache=[], collect_hidden_states=True
+        )
+        selected = adapter.target_forward(
+            model,
+            mx.array([[1, 2, 3, 4]]),
+            cache=[],
+            logits_indices=mx.array([1, 3], dtype=mx.int32),
+        )
+
+        assert head.seen_rows == 2
+        assert selected.logits.tolist() == [
+            [full.logits[0, 1].tolist(), full.logits[0, 3].tolist()]
+        ]
+
+    def test_selective_logits_keep_full_hidden_states_for_mtp(self) -> None:
+        # Gemma4 MTP seeds index target_hidden_row in the packed layout, so the
+        # hidden states must stay row-major over every input row.
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=lambda hidden_states: hidden_states,
+            final_logit_softcapping=None,
+        )
+
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1, 2, 3]]),
+            cache=[],
+            collect_hidden_states=True,
+            logits_indices=mx.array([2], dtype=mx.int32),
+        )
+
+        assert output.hidden_states.shape == (3, 2)
+        assert output.logits.shape == (1, 1, 2)
+
+    def test_selective_logits_apply_softcapping_to_selected_rows(self) -> None:
+        # Post-projection scaling must not be skipped by the selective path.
+        class Backbone:
+            def __call__(self, input_ids, *, cache=None):
+                del input_ids, cache
+                return mx.array([[[-2.0, 0.0], [2.0, 4.0]]])
+
+        model = SimpleNamespace(
+            model=Backbone(),
+            lm_head=lambda hidden_states: hidden_states,
+            final_logit_softcapping=2.0,
+        )
+
+        output = DefaultModelAdapter().target_forward(
+            model,
+            mx.array([[1, 2]]),
+            cache=[],
+            logits_indices=mx.array([1], dtype=mx.int32),
+        )
+
+        expected = mx.tanh(mx.array([[[2.0, 4.0]]]) / 2.0) * 2.0
+        mx.eval(output.logits, expected)
+        assert mx.allclose(output.logits, expected).item()
+
+
+class TestSupportsSelectiveLogits:
+    """The load-time probe that decides whether the split backbone/head path
+    reproduces a model's own output head.
+
+    A wrapper may scale inside its own ``__call__``, which the split path would
+    not reproduce, so the probe compares a one-row forward both ways and only
+    accepts an exact match."""
+
+    def test_accepts_a_head_reproduced_by_the_split_path(self) -> None:
+        class Model:
+            def __init__(self) -> None:
+                self.model = lambda input_ids, cache=None: mx.array([[[1.0, 2.0]]])
+                self.final_logit_softcapping = None
+
+            def __call__(self, input_ids, cache=None):
+                return self.compute_logits(self.model(input_ids, cache=cache))
+
+            def compute_logits(self, hidden_states):
+                return hidden_states * 3.0
+
+        assert DefaultModelAdapter().supports_selective_logits(Model()) is True
+
+    def test_rejects_a_head_with_scaling_hidden_in_the_forward(self) -> None:
+        # The wrapper multiplies after the head, the way Cohere's logit_scale or
+        # Granite's logits_scaling do.  The split path cannot see that, so the
+        # probe must decline rather than return wrong logits.
+        class Model:
+            def __init__(self) -> None:
+                self.model = lambda input_ids, cache=None: mx.array([[[1.0, 2.0]]])
+                self.final_logit_softcapping = None
+
+            def __call__(self, input_ids, cache=None):
+                return self.compute_logits(self.model(input_ids, cache=cache)) * 0.5
+
+            def compute_logits(self, hidden_states):
+                return hidden_states * 3.0
+
+        assert DefaultModelAdapter().supports_selective_logits(Model()) is False
+
+    def test_rejects_a_model_the_split_path_cannot_drive(self) -> None:
+        # No `.model` backbone: the split path raises, so the probe declines
+        # instead of propagating out of load_model.
+        class Model:
+            def __call__(self, input_ids, cache=None):
+                del input_ids, cache
+                return mx.array([[[1.0, 2.0]]])
+
+        assert DefaultModelAdapter().supports_selective_logits(Model()) is False
+
+
+class TestTargetForwardEmbeddings:
     def test_target_input_embeddings_use_target_embed_scale(self) -> None:
         class Embedding:
             def __call__(self, input_ids):
@@ -417,15 +577,16 @@ class TestNormalizeModelConfig:
         ("model_type", "architecture"),
         [
             ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
-            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
-            ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
         ],
     )
-    def test_clears_multimodal_config_for_mlx_quant_wrapper_in_auto_mode(
+    def test_preserves_multimodal_config_for_mlx_quant_wrapper_in_auto_mode(
         self, model_type: str, architecture: str
     ) -> None:
+        # These wrappers serve correctly on the multimodal path with the
+        # pinned mlx-vlm floor, so auto mode must leave their config alone.
+        sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
-            multimodal_config=SimpleNamespace(language_model_only=False),
+            multimodal_config=sentinel,
             hf_config=SimpleNamespace(
                 model_type=model_type,
                 architectures=[architecture],
@@ -435,7 +596,7 @@ class TestNormalizeModelConfig:
 
         DefaultModelAdapter().normalize_model_config(model_config)
 
-        assert model_config.multimodal_config is None
+        assert model_config.multimodal_config is sentinel
 
     def test_preserves_multimodal_config_for_other_models(self) -> None:
         sentinel = SimpleNamespace(language_model_only=False)

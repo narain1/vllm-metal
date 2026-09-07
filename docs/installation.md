@@ -2,7 +2,9 @@
 
 ## Requirements
 
-- macOS on Apple Silicon
+- macOS 15 (Sequoia) or later, on Apple Silicon. The prebuilt wheel's
+  native extension and Metal kernels target macOS 15, so the wheel is
+  tagged `macosx_15_0_arm64` and will not install on earlier releases.
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
 
 > **No compiler required.** The install script below fetches vLLM core and the
@@ -32,9 +34,19 @@ If you run `source ~/.venv-vllm-metal/bin/activate`, the `vllm` CLI becomes avai
 
 For how to use the `vllm` CLI, please refer to the [official vLLM guide](https://docs.vllm.ai/en/latest/cli/).
 
+Development channel (default):
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```
+
+Stable channel:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash -s -- --stable
+```
+
+`pip install vllm-metal` is not supported. Use one of the commands above.
 
 ## Reinstallation and Update
 

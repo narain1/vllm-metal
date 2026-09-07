@@ -6,8 +6,8 @@ between ``n_heads`` (queries) and ``n_kv_heads`` (keys/values) is handled
 transparently by the Metal paged attention kernel.
 
 Handles models whose attention module exposes:
-- ``q_proj``, ``k_proj``, ``o_proj`` linear projections (``v_proj`` optional —
-  see K-eq-V variant below)
+- ``q_proj``, ``k_proj``, ``o_proj`` / ``out_proj`` linear projections
+  (``v_proj`` optional — see K-eq-V variant below)
 - ``rope`` / ``rotary_emb`` for rotary position embeddings, or precomputed
   ``position_embeddings`` supplied by the caller
 - ``n_heads``, ``n_kv_heads`` head counts
@@ -30,11 +30,17 @@ All operations use MLX arrays end-to-end — no PyTorch MPS bridge.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from vllm_metal.attention.attention_contracts import (
+    DEFAULT_ATTENTION_CONTRACT,
+    AttentionContract,
+    QKNormPlacement,
+)
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.varlen_rope_compat import (
@@ -84,7 +90,8 @@ def is_sdpa(module: nn.Module) -> bool:
 
     Accepts two contracts:
 
-    - Split-projection SDPA: ``q_proj`` / ``k_proj`` / ``o_proj``, plus
+    - Split-projection SDPA: ``q_proj`` / ``k_proj`` / output projection
+      (``o_proj``, ``dense`` in Phi, or ``out_proj`` in LFM2), plus
       EITHER ``v_proj`` OR the explicit ``use_k_eq_v = True`` opt-in.
       The latter admits Gemma4 26B / 31B full-attention layers which
       share the K projection for values and never define ``v_proj``
@@ -104,7 +111,7 @@ def is_sdpa(module: nn.Module) -> bool:
     return (
         hasattr(module, "q_proj")
         and hasattr(module, "k_proj")
-        and hasattr(module, "o_proj")
+        and _output_projection(module) is not None
         and (hasattr(module, "v_proj") or getattr(module, "use_k_eq_v", False))
     )
 
@@ -176,6 +183,7 @@ class _KernelMetadata:
     cu_seqlens_q: mx.array
     block_tables: mx.array
     block_size: int
+    max_seq_len: int
 
 
 def _kernel_metadata(
@@ -206,9 +214,56 @@ def _kernel_metadata(
             cu_seqlens_q=mx.array(ctx.cu_seqlens, dtype=mx.int32),
             block_tables=block_tables,
             block_size=kernel_block_size,
+            max_seq_len=max(ctx.context_lens),
         )
         ctx.kernel_metadata_cache[key] = meta
     return meta
+
+
+def _named_norm(module: nn.Module, *names: str) -> nn.Module | None:
+    """Return the first per-head norm present on *module* among *names*.
+
+    mlx_lm spells the per-head Q/K norms differently per architecture:
+    Qwen3/Qwen3.5/Gemma4/OLMo use ``q_norm``/``k_norm``, while Hunyuan
+    (``hunyuan_v1_dense``) uses ``query_layernorm``/``key_layernorm``.
+    Probing by name keeps the caller from silently skipping the norm on
+    architectures that use the second spelling, which produces wrong
+    output rather than an error.
+    """
+    for name in names:
+        norm = getattr(module, name, None)
+        if norm is not None:
+            return norm
+    return None
+
+
+def _output_projection(module: nn.Module) -> nn.Module | None:
+    """Return the attention-output projection on *module*.
+
+    Nearly every mlx_lm SDPA architecture calls it ``o_proj``; Phi-1/1.5
+    (``mlx_lm.models.phi``) spell theirs ``dense`` and LFM2 uses ``out_proj``.
+    Probing by name keeps ``is_sdpa`` and the forward path aligned on the
+    same alias set instead
+    of the forward breaking on architectures that already pass dispatch.
+    """
+    for name in ("o_proj", "dense", "out_proj"):
+        proj = getattr(module, name, None)
+        if proj is not None:
+            return proj
+    return None
+
+
+def _apply_qk_norms(
+    queries: mx.array,
+    keys: mx.array,
+    q_norm: nn.Module | None,
+    k_norm: nn.Module | None = None,
+) -> tuple[mx.array, mx.array]:
+    if q_norm is not None:
+        queries = q_norm(queries)
+    if k_norm is not None:
+        keys = k_norm(keys)
+    return queries, keys
 
 
 # === Q/K/V preparation (YOCO, K-eq-V, v_norm variants) ===
@@ -224,8 +279,9 @@ def prepare_sdpa_qkv(
     *,
     read_existing_kv: bool = False,
     position_embeddings: tuple[mx.array, mx.array] | None = None,
+    attention_contract: AttentionContract = DEFAULT_ATTENTION_CONTRACT,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array | None, tuple[mx.array, mx.array]]:
-    """Project ``x`` into Q/K/V with norms, RoPE and Gemma4 variants.
+    """Project ``x`` into Q/K/V with architecture-aware norms and RoPE.
 
     Handles three Gemma4-specific branches:
 
@@ -260,10 +316,12 @@ def prepare_sdpa_qkv(
           the caller can forward them to the next YOCO layer.
 
     Raises:
-        NotImplementedError: If ``inner`` has neither ``rope`` nor
-            ``rotary_emb`` (only RoPE-based models are supported).
+        NotImplementedError: If no precomputed rotary embeddings are provided,
+            and ``inner`` has neither ``rope`` nor ``rotary_emb`` and does not
+            explicitly disable RoPE.
     """
     B, L, _ = x.shape  # noqa: N806
+    norm_placement = attention_contract.qk_norm_placement
     if shared_kv is not None and read_existing_kv:
         raise ValueError("shared_kv and read_existing_kv are mutually exclusive")
 
@@ -322,8 +380,9 @@ def prepare_sdpa_qkv(
             values = keys
         else:
             keys, values = shared_kv
-        if hasattr(inner, "q_norm"):
-            queries = inner.q_norm(queries)
+        q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
+        if norm_placement is QKNormPlacement.BEFORE_ROPE:
+            queries, keys = _apply_qk_norms(queries, keys, q_norm)
         queries = queries.transpose(0, 2, 1, 3)
         queries, _ = apply_attention_rope(
             inner,
@@ -334,7 +393,10 @@ def prepare_sdpa_qkv(
             apply_keys=False,
             positions=ctx.segment_positions,
             position_embeddings=position_embeddings,
+            use_rope=attention_contract.use_rope,
         )
+        if norm_placement is QKNormPlacement.AFTER_ROPE:
+            queries, keys = _apply_qk_norms(queries, keys, q_norm)
     else:
         if not packed_qkv:
             keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
@@ -345,10 +407,10 @@ def prepare_sdpa_qkv(
                 values = keys
 
         # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4, Phi3/Phi4 when present).
-        if hasattr(inner, "q_norm"):
-            queries = inner.q_norm(queries)
-        if hasattr(inner, "k_norm"):
-            keys = inner.k_norm(keys)
+        q_norm = _named_norm(inner, "q_norm", "query_layernorm", "q_layernorm")
+        k_norm = _named_norm(inner, "k_norm", "key_layernorm", "k_layernorm")
+        if norm_placement is QKNormPlacement.BEFORE_ROPE:
+            queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
         if hasattr(inner, "v_norm"):
             values = inner.v_norm(values)
 
@@ -365,7 +427,10 @@ def prepare_sdpa_qkv(
             offsets=ctx.offsets if ctx.offsets else None,
             positions=ctx.segment_positions,
             position_embeddings=position_embeddings,
+            use_rope=attention_contract.use_rope,
         )
+        if norm_placement is QKNormPlacement.AFTER_ROPE:
+            queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
 
     kv_for_sharing = (keys, values)
     return queries, keys, values, gate, kv_for_sharing
@@ -470,8 +535,9 @@ def sdpa_forward(
     *,
     read_existing_kv: bool = False,
     position_embeddings: tuple[mx.array, mx.array] | None = None,
+    attention_contract: AttentionContract = DEFAULT_ATTENTION_CONTRACT,
 ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
-    """Full SDPA forward pass: project → norm → RoPE → Metal kernel.
+    """Full SDPA forward pass: project → norm/RoPE → Metal kernel.
 
     Handles MHA, GQA, and MQA uniformly — the head ratio between
     query and KV heads is passed to the Metal kernel which handles
@@ -486,13 +552,30 @@ def sdpa_forward(
     # Resolve head counts — mlx_lm uses different attribute names:
     #   Qwen3/Llama/Gemma/Gemma4: n_heads, n_kv_heads
     #   Qwen3.5 (Qwen3Next):      num_attention_heads, num_key_value_heads
-    n_heads = getattr(inner, "n_heads", None) or inner.num_attention_heads
-    n_kv_heads = getattr(inner, "n_kv_heads", None) or inner.num_key_value_heads
+    #   StableLM:                 num_heads, num_key_value_heads
+    #   DeepseekAttention:        num_attention_heads, num_kv_heads
+    n_heads = (
+        getattr(inner, "n_heads", None)
+        or getattr(inner, "num_attention_heads", None)
+        or inner.num_heads
+    )
+    n_kv_heads = (
+        getattr(inner, "n_kv_heads", None)
+        or getattr(inner, "num_kv_heads", None)
+        or inner.num_key_value_heads
+    )
 
     # Softmax scale — GPT-OSS names it sm_scale rather than scale.
     attn_scale = getattr(inner, "scale", None)
     if attn_scale is None:
-        attn_scale = inner.sm_scale
+        attn_scale = getattr(inner, "sm_scale", None)
+
+    # Attention logit softcapping (Gemma 2: ``attn_logit_softcapping``).
+    # mlx_lm applies ``tanh(qk / cap) * cap`` to the pre-softmax scores; the
+    # Metal kernel implements the same clamp and treats any value <= 0 as
+    # disabled, so architectures that do not define the attribute keep the
+    # previous uncapped path unchanged.
+    attn_softcap = float(getattr(inner, "attn_logit_softcapping", None) or 0.0)
 
     # Attention sinks: a learned per-head logit that joins the softmax
     # denominator without contributing a value row (GPT-OSS). Models without
@@ -512,7 +595,17 @@ def sdpa_forward(
         shared_kv,
         read_existing_kv=read_existing_kv,
         position_embeddings=position_embeddings,
+        attention_contract=attention_contract,
     )
+    if attn_scale is None:
+        if not attention_contract.derive_scale_from_query:
+            raise AttributeError(
+                f"{type(inner).__module__}.{type(inner).__name__} exposes "
+                "neither 'scale' nor 'sm_scale'"
+            )
+        # StableLM computes the standard scale inline and exposes no scale
+        # attribute. Use the projected query width before any cache padding.
+        attn_scale = math.sqrt(1 / queries.shape[-1])
 
     # --- Metal kernel dispatch ---
     n_heads = queries.shape[1]
@@ -562,8 +655,9 @@ def sdpa_forward(
     seq_lens = meta.seq_lens
     cu_seqlens_q = meta.cu_seqlens_q
     block_tables, kernel_block_size = meta.block_tables, meta.block_size
-    max_seq_len = max(ctx.context_lens)
+    max_seq_len = meta.max_seq_len
 
+    v_centroids: mx.array | None = None
     if shared_kv is not None or read_existing_kv:
         # YOCO shared layer / MTP read-existing layer: the authoritative K/V
         # already lives in the paged cache.  Skip writes to avoid redundant
@@ -681,17 +775,19 @@ def sdpa_forward(
             kernel_key_zero = new_key_zero_cache.reshape(
                 -1, kernel_block_size, cache_kv_heads, sg
             )
-        # Get Lloyd-Max centroids for V quantization (lazily computed, cached)
-        from vllm_metal.attention.caches.turboquant import get_v_centroids
+        # Get Lloyd-Max centroids for V quantization (lazily computed, cached).
+        # Resolved once per layer and shared by tq_encode + paged_attention.
+        if v_centroids is None:
+            from vllm_metal.attention.caches.turboquant import get_v_centroids
 
-        v_centroids = get_v_centroids(kv_cache.v_bits)
+            v_centroids = get_v_centroids(kv_cache.v_bits)
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,
             kernel_v_cache,
             cache_kv_heads,
             attn_scale,
-            0.0,  # softcap (0 = disabled)
+            attn_softcap,
             block_tables,
             seq_lens,
             cu_seqlens_q,
@@ -719,7 +815,7 @@ def sdpa_forward(
             kernel_v_cache,
             cache_kv_heads,
             attn_scale,
-            0.0,  # softcap (0 = disabled)
+            attn_softcap,
             block_tables,
             seq_lens,
             cu_seqlens_q,
@@ -736,7 +832,7 @@ def sdpa_forward(
     if gate is not None:
         out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
-    return inner.o_proj(out), kv_for_sharing
+    return _output_projection(inner)(out), kv_for_sharing
 
 
 def apply_g_proj_gate(

@@ -62,15 +62,15 @@ class PagedAttentionContext:
     # Cumulative sequence length array: [0, len0, len0+len1, ...]
     # (length = num_requests + 1).
     cu_seqlens: list[int] | None = None
-    # GDN state slot mappings — exactly one of the two is set for hybrid
+    # State slot mappings — exactly one of the two is set for hybrid
     # models (both None for non-hybrid).  In mamba_cache_mode "none" the
-    # state manager sets ``gdn_slot_mapping`` (request batch position →
-    # private stable slot, shared by every linear layer); under align-mode
-    # prefix caching it sets ``gdn_group_slot_mappings`` instead (one list
+    # state manager sets ``state_slot_mapping`` (request batch position →
+    # private stable slot, shared by every state layer); under align-mode
+    # prefix caching it sets ``state_group_slot_mappings`` instead (one list
     # per mamba cache group, request batch position → that group's scheduler
     # block id / state slab).
-    gdn_slot_mapping: list[int] | None = None
-    gdn_group_slot_mappings: tuple[list[int], ...] | None = None
+    state_slot_mapping: list[int] | None = None
+    state_group_slot_mappings: tuple[list[int], ...] | None = None
     # Number of decode requests packed at the front of the batch.
     # This lets attention wrappers distinguish pure prefill from mixed prefill+decode
     # without reverse-engineering one-token segments from ``cu_seqlens``.
@@ -274,9 +274,9 @@ def prepare_grouped(
             cu_seqlens=cu_seqlens,
             offsets=offsets,
             num_decode_requests=len(decode_requests),
-            # Window routing applies only to pure-verification batches;
-            # any prefill segment keeps the whole batch on the tiled
-            # kernel, numerically identical to the non-speculative path.
+            # Window routing applies only to pure-verification batches. Any
+            # prefill segment keeps the whole batch on a prefill kernel (tiled,
+            # or NAX on M5), never the verification-window kernel.
             verify_window_q=1 if prefill_requests else max_decode_window,
             kv_groups=kv_groups,
         )

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Gemma4-specific branches in sdpa.
+"""Unit tests for paged SDPA attention contracts.
 
 Covers:
 - ``pad_qkv_to_cache_head_dim`` / ``truncate_padded_output`` pure helpers.
 - ``prepare_sdpa_qkv`` branches (K-eq-V fallback, v_norm, YOCO shared_kv).
-- ``sdpa_forward`` propagation of per-layer ``num_kv_heads`` to the kernel.
+- ``sdpa_forward`` propagation of per-layer metadata to the kernel.
 
 The ``prepare_sdpa_qkv`` tests use minimal fake attention modules rather
 than real mlx_lm Attention modules so they stay fast and deterministic.
@@ -21,6 +21,10 @@ import mlx.nn as nn
 import pytest
 
 import vllm_metal.attention.impls.sdpa as sdpa_mod
+from vllm_metal.attention.attention_contracts import (
+    AttentionContract,
+    attention_contract_for,
+)
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.mha_layout import (
     MHAKVCacheLayout,
@@ -548,6 +552,48 @@ class TestPrepareSDPAQKV:
                 shared_kv=(shared_k, shared_v),
             )
 
+    def test_contract_without_rope_keeps_projections_unrotated(self) -> None:
+        inner = _make_inner(with_v_proj=True)
+        del inner.rope
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        expected_q = mx.full((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM), float(_HIDDEN))
+        expected_k = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), float(_HIDDEN))
+
+        queries, keys, _, _, _ = prepare_sdpa_qkv(
+            inner,
+            x,
+            ctx,
+            _N_HEADS,
+            _N_KV_HEADS,
+            attention_contract=AttentionContract(use_rope=False),
+        )
+
+        assert mx.array_equal(queries, expected_q)
+        assert mx.array_equal(keys, expected_k)
+
+    def test_contract_without_rope_covers_the_shared_kv_path(self) -> None:
+        inner = _make_inner(with_v_proj=True)
+        del inner.rope
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        shared_k = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), 1.0)
+        shared_v = mx.full((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM), 1.0)
+        expected_q = mx.full((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM), float(_HIDDEN))
+
+        queries, keys, _, _, _ = prepare_sdpa_qkv(
+            inner,
+            x,
+            ctx,
+            _N_HEADS,
+            _N_KV_HEADS,
+            shared_kv=(shared_k, shared_v),
+            attention_contract=AttentionContract(use_rope=False),
+        )
+
+        assert mx.array_equal(queries, expected_q)
+        assert mx.array_equal(keys, shared_k)
+
     def test_precomputed_rope_path_does_not_require_rope_attribute(self) -> None:
         # Arrange — some VLMs precompute ``(cos, sin)`` at the model level
         # and pass those embeddings into ``self_attn`` positionally.
@@ -627,6 +673,78 @@ class _PagedRoutingOpsSpy:
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
 
+    def test_deepseek_num_kv_heads_naming_reaches_kernel(self) -> None:
+        """DeepSeek exposes ``num_kv_heads``, not ``num_key_value_heads``."""
+        from mlx_lm.models.deepseek import DeepseekAttention, ModelArgs
+
+        args = ModelArgs(
+            model_type="deepseek",
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+        inner = DeepseekAttention(args)
+        x = mx.zeros((1, 2, 16), dtype=mx.float16)
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=4,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        captured: dict[str, int | float] = {}
+
+        class _FakeOps:
+            def reshape_and_cache(
+                self,
+                _keys,
+                _values,
+                key_cache,
+                value_cache,
+                _slot_mapping,
+            ) -> tuple[mx.array, mx.array]:
+                return key_cache, value_cache
+
+            def paged_attention_primitive(
+                self,
+                _query,
+                _key_cache,
+                _value_cache,
+                num_kv_heads,
+                scale,
+                *_args,
+                **_kwargs,
+            ) -> None:
+                captured["num_kv_heads"] = num_kv_heads
+                captured["scale"] = scale
+
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((1, 2, 16), dtype=mx.float16),
+            ),
+        ):
+            output, (keys, values) = sdpa_forward(
+                inner,
+                x,
+                _make_ctx(2),
+                cache,
+                layer_idx=0,
+            )
+
+        mx.eval(output, keys, values)
+        assert output.shape == (1, 2, 16)
+        assert keys.shape == (1, 2, 2, 4)
+        assert values.shape == (1, 2, 2, 4)
+        assert captured["num_kv_heads"] == 2
+        assert captured["scale"] == 0.5
+
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
         layout = MHAKVCacheLayout(
@@ -684,12 +802,12 @@ class TestSDPAForward:
         assert sliding_call.block_tables == [[8, 9], [10, 0]]
         assert sliding_call.block_size == 16
 
-    def test_kernel_receives_per_layer_kv_heads(self) -> None:
-        """Heterogeneous layers must pass their concrete KV-head count.
+    def test_kernel_uses_layer_heads_and_registered_default_scale(self) -> None:
+        """Kernel metadata comes from the layer, not padded cache allocation.
 
-        Regression guard for Gemma4-style mixed KV layouts: ``sdpa_forward``
-        resolves the layer's actual cache shape from ``kv_heads_per_layer``
-        and must pass that same count to ``paged_attention_primitive``.
+        StableLM exposes no scale attribute. Mixed layouts may allocate a wider
+        cache, but its registered default must use the projected query width.
+        Unregistered scale-less modules must continue to fail before dispatch.
         """
         actual_kv_heads = 1
         cache = MetalPagedKVCache(
@@ -700,14 +818,25 @@ class TestSDPAForward:
             block_size=8,
             dtype=mx.float16,
             kv_heads_per_layer=[_N_KV_HEADS, actual_kv_heads],
-            head_dim_per_layer=[_HEAD_DIM, _HEAD_DIM],
+            head_dim_per_layer=[_HEAD_DIM, _CACHE_HEAD_DIM],
         )
 
-        inner = SimpleNamespace(
-            n_heads=_N_HEADS,
-            n_kv_heads=actual_kv_heads,
-            scale=_HEAD_DIM**-0.5,
-            o_proj=lambda out: out,
+        from mlx_lm.models.stablelm import Attention, ModelArgs
+
+        inner = Attention(
+            ModelArgs(
+                model_type="stablelm",
+                vocab_size=32,
+                hidden_size=_HIDDEN,
+                num_attention_heads=_N_HEADS,
+                num_hidden_layers=1,
+                num_key_value_heads=actual_kv_heads,
+                intermediate_size=16,
+                rope_theta=10_000.0,
+                use_qkv_bias=False,
+                partial_rotary_factor=0.25,
+                layer_norm_eps=1e-5,
+            )
         )
         ctx = _make_ctx(_SEQ_LEN)
         x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
@@ -717,7 +846,7 @@ class TestSDPAForward:
         values = mx.ones((_BATCH, actual_kv_heads, _SEQ_LEN, _HEAD_DIM))
         kv_for_sharing = (keys, values)
 
-        captured: dict[str, int] = {}
+        captured: dict[str, int | float] = {}
 
         class _FakeOps:
             def reshape_and_cache(
@@ -736,10 +865,12 @@ class TestSDPAForward:
                 _key_cache,
                 _value_cache,
                 num_kv_heads,
+                scale,
                 *_args,
                 **_kwargs,
             ) -> None:
                 captured["num_kv_heads"] = num_kv_heads
+                captured["scale"] = scale
 
         with (
             patch.object(
@@ -754,9 +885,25 @@ class TestSDPAForward:
                 return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
             ),
         ):
-            sdpa_forward(inner, x, ctx, cache, layer_idx=1)
+            unregistered = SimpleNamespace(
+                n_heads=_N_HEADS,
+                n_kv_heads=actual_kv_heads,
+                o_proj=lambda out: out,
+            )
+            with pytest.raises(AttributeError, match="neither 'scale' nor 'sm_scale'"):
+                sdpa_forward(unregistered, x, ctx, cache, layer_idx=1)
+
+            sdpa_forward(
+                inner,
+                x,
+                ctx,
+                cache,
+                layer_idx=1,
+                attention_contract=attention_contract_for(inner),
+            )
 
         assert captured["num_kv_heads"] == actual_kv_heads
+        assert captured["scale"] == pytest.approx(_HEAD_DIM**-0.5)
 
     def test_gpt_oss_scale_and_sinks_reach_kernel(self) -> None:
         """GPT-OSS exposes ``sm_scale`` and per-head attention sinks."""
@@ -828,6 +975,90 @@ class TestSDPAForward:
         assert captured["scale"] == expected_scale
         assert isinstance(sinks, mx.array)
         assert sinks.dtype == mx.float32
+
+    def _run_capturing_softcap(self, inner: SimpleNamespace) -> float:
+        """Drive ``sdpa_forward`` and return the softcap the kernel received."""
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM))
+        keys = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        captured: dict[str, float] = {}
+
+        class _FakeOps:
+            def reshape_and_cache(
+                self,
+                _key,
+                _value,
+                key_cache,
+                value_cache,
+                _slot_mapping,
+            ) -> tuple[mx.array, mx.array]:
+                return key_cache, value_cache
+
+            def paged_attention_primitive(
+                self,
+                _query,
+                _key_cache,
+                _value_cache,
+                _num_kv_heads,
+                _scale,
+                softcap,
+                *_args,
+                **_kwargs,
+            ) -> None:
+                captured["softcap"] = softcap
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+
+        return captured["softcap"]
+
+    def test_attn_logit_softcapping_reaches_kernel(self) -> None:
+        """Gemma 2 caps pre-softmax scores; the kernel must receive the value."""
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            attn_logit_softcapping=50.0,
+            o_proj=lambda out: out,
+        )
+        assert self._run_capturing_softcap(inner) == 50.0
+
+    def test_softcap_defaults_to_disabled_without_the_attribute(self) -> None:
+        """Architectures without the attribute keep the uncapped kernel path.
+
+        The kernel treats any value <= 0 as disabled, so this is the
+        regression guard that plumbing the value changed nothing for the
+        models that were already working.
+        """
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            o_proj=lambda out: out,
+        )
+        assert self._run_capturing_softcap(inner) == 0.0
 
     def test_shared_kv_path_does_not_rebind_cache_arrays(self) -> None:
         """Shared-KV attention must read the existing cache without writing."""
@@ -988,3 +1219,89 @@ class TestApplyGProjGate:
 
         assert result.shape == out.shape
         assert mx.allclose(result, expected, atol=1e-6).item()
+
+
+class TestPhiAttention:
+    """Phi-1/1.5 (``mlx_lm.models.phi``) reaches the paged kernel.
+
+    The real class spells its output projection ``dense`` (not ``o_proj``)
+    and computes the standard softmax scale inline, so it needs both the
+    dispatch alias and the query-derived-scale contract to serve on the
+    paged path.
+    """
+
+    def test_phi_dispatch_and_derived_scale_reach_kernel(self) -> None:
+        """is_sdpa accepts ``dense`` and the kernel sees head_dim**-0.5."""
+        from mlx_lm.models.phi import ModelArgs, PhiAttention
+
+        n_heads, n_kv_heads, head_dim = 4, 2, 16
+        hidden = n_heads * head_dim
+        inner = PhiAttention(
+            ModelArgs(
+                model_type="phi",
+                vocab_size=32,
+                hidden_size=hidden,
+                num_attention_heads=n_heads,
+                num_hidden_layers=1,
+                num_key_value_heads=n_kv_heads,
+                partial_rotary_factor=0.5,
+                intermediate_size=16,
+            )
+        )
+
+        assert sdpa_mod.is_sdpa(inner)
+
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, hidden))
+
+        queries = mx.ones((_BATCH, n_heads, _SEQ_LEN, head_dim))
+        keys = mx.ones((_BATCH, n_kv_heads, _SEQ_LEN, head_dim))
+        values = mx.ones((_BATCH, n_kv_heads, _SEQ_LEN, head_dim))
+        kv_for_sharing = (keys, values)
+
+        captured: dict[str, float] = {}
+
+        class _FakeOps:
+            def reshape_and_cache(
+                self, _key, _value, key_cache, value_cache, _slot_mapping
+            ):
+                return key_cache, value_cache
+
+            def paged_attention_primitive(
+                self, _query, _key_cache, _value_cache, _num_kv_heads, scale, *_a, **_k
+            ):
+                captured["scale"] = scale
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, kv_for_sharing),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, hidden)),
+            ),
+        ):
+            out = sdpa_forward(
+                inner,
+                x,
+                ctx,
+                cache,
+                layer_idx=0,
+                attention_contract=attention_contract_for(inner),
+            )
+
+        assert captured["scale"] == pytest.approx(head_dim**-0.5)
+        # The output ran through PhiAttention.dense, not a missing o_proj.
+        assert out is not None

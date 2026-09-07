@@ -12,9 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from mlx_lm.models.nemotron_h import Model as NemotronHModel
+from mlx_lm.models.nemotron_h import ModelArgs as NemotronHModelArgs
 
 import vllm_metal.envs as envs
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import NEMOTRON_H_TINY_ARGS, make_stub_runner
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.config import reset_config
 from vllm_metal.distributed.pipeline import PipelineGroup
@@ -51,9 +53,54 @@ def _runner_model_config(**overrides: object) -> object:
         "dtype": torch.float16,
         "quantization": None,
         "model_weights": "",
+        "hf_token": None,
+        "revision": None,
+        "tokenizer": None,
+        "tokenizer_revision": None,
+        "is_hybrid": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+_GDN_HYBRID_ARGS = {
+    "model_type": "qwen3_5",
+    "num_hidden_layers": 8,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "hidden_size": 1024,
+    "full_attention_interval": 4,
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 4,
+    "linear_key_head_dim": 32,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 3,
+}
+
+_JAMBA_ARGS = {
+    "model_type": "jamba",
+    "num_hidden_layers": 32,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "hidden_size": 4096,
+}
+
+_NEMOTRON_H_ARGS = {
+    "model_type": "nemotron_h",
+    "num_hidden_layers": 52,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 2,
+    "hidden_size": 2688,
+    "head_dim": 128,
+    "hybrid_override_pattern": list(
+        "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+    ),
+    "mamba_num_heads": 64,
+    "mamba_head_dim": 64,
+    "ssm_state_size": 128,
+    "n_groups": 8,
+    "conv_kernel": 4,
+}
 
 
 def _text_config(**overrides: object) -> SimpleNamespace:
@@ -233,6 +280,22 @@ class TestModelLifecycle:
         assert request.tokenizer_config == {"trust_remote_code": True}
         assert calls == [hf_config]
 
+    def test_effective_multimodal_gguf_is_rejected(self) -> None:
+        runner = make_stub_runner(
+            model_config=_runner_model_config(
+                hf_config=SimpleNamespace(model_type="custom_vlm"),
+                is_multimodal_model=True,
+                quantization="gguf",
+                model_weights="stub-model.gguf",
+            ),
+        )
+
+        with pytest.raises(NotImplementedError, match="Multimodal GGUF"):
+            GenerationLoadRequest.from_runner(
+                runner,
+                SimpleNamespace(should_force_text_backbone=lambda _: False),
+            )
+
     def test_model_load_request_marks_pipeline_stage_lazy(self) -> None:
         # A pipeline-parallel stage (pp.size > 1) loads weights lazily so it can
         # prune its non-owned layers before the first eval; a single-stage load
@@ -329,11 +392,25 @@ class TestModelLifecycle:
 
         assert runner._is_vlm is False
 
-    def test_load_uses_adapter_override_for_qwen35_mlx_quant_dense_wrapper(
+    def test_load_keeps_qwen35_mlx_quant_dense_wrapper_as_vlm(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        _stub_generation_model(monkeypatch, config=_text_config())
+        # The auto-mode override used to route MLX-quantized wrappers to the
+        # text backbone; the pinned mlx-vlm floor serves them natively, so auto
+        # mode now keeps the multimodal path.
+        vision_tower = object()
+        language_model = _Qwen35LanguageModelStub()
+        fake_model = _qwen35_vlm_model(
+            vision_tower=vision_tower,
+            language_model=language_model,
+        )
+        _stub_generation_model(
+            monkeypatch,
+            config=fake_model.config,
+            is_vlm=True,
+            model=fake_model,
+        )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
                 hf_config=SimpleNamespace(
@@ -349,8 +426,8 @@ class TestModelLifecycle:
 
         lifecycle.load()
 
-        assert runner._is_vlm is False
-        assert runner._multimodal_adapter is None
+        assert runner._is_vlm is True
+        assert isinstance(runner._multimodal_adapter, Qwen3VLMultimodalAdapter)
 
     def test_load_multimodal_native_mode_keeps_qwen35_fp8_as_vlm(
         self,
@@ -592,7 +669,7 @@ class TestModelLifecycle:
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(),
         )
-        runner.vllm_config = SimpleNamespace(speculative_config=speculative_config)
+        runner.vllm_config.speculative_config = speculative_config
 
         lifecycle.load()
 
@@ -629,7 +706,7 @@ class TestModelLifecycle:
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(),
         )
-        runner.vllm_config = SimpleNamespace(speculative_config=speculative_config)
+        runner.vllm_config.speculative_config = speculative_config
         runner._gemma4_mtp_assistant = object()
 
         with pytest.raises(RuntimeError, match="assistant load failed"):
@@ -754,6 +831,65 @@ class TestModelLifecycle:
         assert runner.model_args["model_type"] == "gemma4"
         assert runner.model_args["vocab_size"] == _TEXT_MODEL_ARGS["vocab_size"]
 
+    def test_load_reads_omitted_text_keys_off_the_built_language_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A re-saved Qwen3.5 config omits full_attention_interval; mlx-lm
+        resolves it to 4 on the built text model, and routing must see that."""
+        text_config = dict(_TEXT_MODEL_ARGS) | {
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 3,
+        }
+        args = SimpleNamespace(model_type="qwen3_5", text_config=text_config)
+        fake_model = SimpleNamespace(
+            args=args,
+            language_model=SimpleNamespace(
+                args=SimpleNamespace(**text_config, full_attention_interval=4)
+            ),
+        )
+        _stub_generation_model(monkeypatch, config=None, model=fake_model)
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(is_hybrid=True)
+        )
+
+        lifecycle.load()
+
+        assert runner.model_args["full_attention_interval"] == 4
+        assert runner.hybrid_runtime_plan.family.label == "gdn"
+        assert runner.hybrid_runtime_plan.layers.num_attention == (
+            _TEXT_MODEL_ARGS["num_hidden_layers"] // 4
+        )
+
+    def test_load_routes_the_mlx_vlm_text_model_type_to_the_gdn_family(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """mlx-vlm flattens text_config, whose model_type is the ``_text`` name."""
+        text_config = _text_config(
+            model_type="qwen3_5_text",
+            full_attention_interval=4,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=3,
+        )
+        _stub_generation_model(
+            monkeypatch, config=SimpleNamespace(text_config=text_config), is_vlm=True
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(is_hybrid=True, is_multimodal_model=True)
+        )
+
+        lifecycle.load()
+
+        assert runner.model_args["model_type"] == "qwen3_5_text"
+        assert runner.hybrid_runtime_plan.family.label == "gdn"
+
     def test_load_stt_model_loads_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_model = SimpleNamespace(
             create_runtime_adapter=lambda model_name: (object(), model_name)
@@ -865,6 +1001,7 @@ class TestModelLifecycle:
     def test_load_routes_gguf_to_owner_on_quantization_detection(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         """``quantization == "gguf"`` (set by the GGUF engine integration for a
         .gguf) delegates the whole load to ``GGUFModelLoader`` (lazily imported)
@@ -915,12 +1052,16 @@ class TestModelLifecycle:
             SimpleNamespace(GGUFModelLoader=_StubGGUFLoader),
         )
         monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_mlx_lm_load)
+        config_dir = tmp_path / "config"
+        tokenizer_dir = tmp_path / "tokenizer"
+        config_dir.mkdir()
+        tokenizer_dir.mkdir()
 
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
-                model="config-dir",
+                model=str(config_dir),
                 quantization="gguf",
-                tokenizer="tokenizer-dir",
+                tokenizer=str(tokenizer_dir),
                 model_weights="stub-model.gguf",
             )
         )
@@ -935,8 +1076,8 @@ class TestModelLifecycle:
         assert len(loader_calls) == 1
         call = loader_calls[0]
         assert call["gguf_path"] == "stub-model.gguf"
-        assert call["config_dir"] == "config-dir"
-        assert call["tokenizer_dir"] == "tokenizer-dir"
+        assert call["config_dir"] == str(config_dir)
+        assert call["tokenizer_dir"] == str(tokenizer_dir)
         assert call["target_dtype"] is not None, (
             "lifecycle must derive target_dtype from runner.model_config.dtype "
             "and thread it to the owner"
@@ -1032,10 +1173,83 @@ class TestModelLifecycle:
 
 
 class TestResolveModelDims:
-    def _resolve(self, args: dict[str, object]) -> object:
-        lifecycle, runner = _make_lifecycle(model_args=args)
+    def _resolve(self, args: dict[str, object], *, is_hybrid: bool = False) -> object:
+        lifecycle, runner = _make_lifecycle(
+            model_args=args, model_config=_runner_model_config(is_hybrid=is_hybrid)
+        )
         lifecycle.resolve_model_dims()
         return runner
+
+    def test_hybrid_model_installs_its_family_plan(self) -> None:
+        runner = self._resolve(_GDN_HYBRID_ARGS, is_hybrid=True)
+
+        assert runner.hybrid_runtime_plan.family.label == "gdn"
+        assert runner.hybrid_runtime_plan.layers.attention_indices == (3, 7)
+
+    def test_routing_follows_the_typed_field_not_the_args(self) -> None:
+        runner = self._resolve(_GDN_HYBRID_ARGS, is_hybrid=False)
+
+        assert runner.hybrid_runtime_plan is None
+
+    def test_hybrid_model_without_a_family_rejects_before_any_plan(self) -> None:
+        lifecycle, runner = _make_lifecycle(
+            model_args=_JAMBA_ARGS,
+            model_config=_runner_model_config(is_hybrid=True),
+        )
+
+        with pytest.raises(NotImplementedError, match="model_type='jamba'"):
+            lifecycle.resolve_model_dims()
+        assert runner.hybrid_runtime_plan is None
+
+    def test_nemotron_pattern_resolves_from_layers_block_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The published checkpoint config carries layers_block_type only;
+        # mlx-lm resolves hybrid_override_pattern on the built args.
+        raw_args = {
+            k: v
+            for k, v in NEMOTRON_H_TINY_ARGS.items()
+            if k != "hybrid_override_pattern"
+        }
+        raw_args["layers_block_type"] = ["mamba", "mlp", "attention", "mamba"]
+        raw_args["num_hidden_layers"] = 4
+        model = NemotronHModel(NemotronHModelArgs(**raw_args))
+        _stub_generation_model(monkeypatch, config=None, model=model)
+        lifecycle, runner = _make_lifecycle(
+            model_config=_runner_model_config(is_hybrid=True)
+        )
+
+        lifecycle.load()
+
+        assert runner.hybrid_runtime_plan.family.label == "nemotron_h"
+        assert runner.hybrid_runtime_plan.layers.layer_roles == (
+            "state",
+            "stateless",
+            "attention",
+            "state",
+        )
+
+    def test_nemotron_model_installs_its_family_plan(self) -> None:
+        runner = self._resolve(_NEMOTRON_H_ARGS, is_hybrid=True)
+
+        assert runner.hybrid_runtime_plan.family.label == "nemotron_h"
+        assert runner.hybrid_runtime_plan.layers.attention_indices == (
+            5,
+            12,
+            19,
+            26,
+            33,
+            42,
+        )
+        assert runner.hybrid_runtime_plan.layers.num_state == 23
+        assert runner.head_dim == 128
+
+    def test_nemotron_head_dim_resolves_like_mlx_lm_when_omitted(self) -> None:
+        args = {k: v for k, v in _NEMOTRON_H_ARGS.items() if k != "head_dim"}
+
+        runner = self._resolve(args, is_hybrid=True)
+
+        assert runner.head_dim == 2688 // 32
 
     def test_standard_mha(self) -> None:
         runner = self._resolve(

@@ -156,8 +156,16 @@ class ModelAdapter(Protocol):
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
-        """Run the target text model and optionally retain target hidden states."""
+        """Run the target text model and optionally retain target hidden states.
+
+        ``logits_indices`` requests logits for those input rows only, and is
+        valid only when :meth:`supports_selective_logits` returned ``True``.
+        """
+
+    def supports_selective_logits(self, model: Any) -> bool:
+        """Whether ``target_forward`` may honour ``logits_indices`` for ``model``."""
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for ``input_ids``."""
@@ -243,13 +251,12 @@ class DefaultModelAdapter(ModelAdapter):
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
-        marked multimodal even when served text-only, and both quantized
-        families diverge under mlx_vlm.load() — FP8 fails on
-        `*_weight_scale_inv` tensors, while MLX affine checkpoints load but,
-        unless the config exposes a real VL shape, run the bare language model
-        with unset mrope state and generate garbled output.  Both route through
-        the mlx_lm text loader instead; MLX-quant wrappers with a native VL
-        config keep the multimodal path.
+        marked multimodal even when served text-only, and the FP8 family fails
+        under mlx_vlm.load() on `*_weight_scale_inv` tensors, so it routes
+        through the mlx_lm text loader instead.  MLX affine checkpoints used to
+        need the same treatment because mlx_vlm left their mRoPE state unset;
+        the pinned mlx-vlm floor (>=0.6.8) drives them correctly, so they keep
+        the native multimodal path.
         """
         if hf_config is None:
             return False
@@ -269,18 +276,21 @@ class DefaultModelAdapter(ModelAdapter):
         if self._has_fp8_quantization_config(hf_config):
             return True
 
-        # MLX affine Qwen3.5/Qwen3.6 text wrappers may still carry a
-        # vision_config, but mlx_vlm drives those text-only checkpoints with
-        # unset mRoPE state and produces garbled output.  Real Qwen3-VL uses
-        # Qwen3VLForConditionalGeneration, which is not in the text-wrapper
-        # architecture set above and therefore keeps the native path.
-        return self._has_mlx_quantized_weights(hf_config)
+        # MLX affine wrappers only keep the native path when
+        # `build_multimodal_adapter` actually has an adapter for them. The MoE
+        # and Qwen3.6 wrappers do not, and an image request against a missing
+        # adapter raises in the runner, so they stay on the text backbone.
+        return self._has_mlx_quantized_weights(
+            hf_config
+        ) and not self._is_qwen3_vl_family(hf_config)
 
-    def _has_fp8_quantization_config(self, hf_config: Any) -> bool:
-        quantization_config_from_hf = getattr(hf_config, "quantization_config", None)
-        if isinstance(quantization_config_from_hf, dict):
-            return quantization_config_from_hf.get("quant_method") == "fp8"
-        return getattr(quantization_config_from_hf, "quant_method", None) == "fp8"
+    def _is_qwen3_vl_family(self, hf_config: Any) -> bool:
+        """Whether ``build_multimodal_adapter`` has a native adapter for this."""
+        model_type = getattr(hf_config, "model_type", "")
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        return model_type in _QWEN3_VL_MODEL_TYPES or any(
+            arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
+        )
 
     def _has_mlx_quantized_weights(self, hf_config: Any) -> bool:
         mlx_quantization_from_hf = getattr(hf_config, "quantization", None)
@@ -288,6 +298,12 @@ class DefaultModelAdapter(ModelAdapter):
             isinstance(mlx_quantization_from_hf, dict)
             and "bits" in mlx_quantization_from_hf
         )
+
+    def _has_fp8_quantization_config(self, hf_config: Any) -> bool:
+        quantization_config_from_hf = getattr(hf_config, "quantization_config", None)
+        if isinstance(quantization_config_from_hf, dict):
+            return quantization_config_from_hf.get("quant_method") == "fp8"
+        return getattr(quantization_config_from_hf, "quant_method", None) == "fp8"
 
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether the current serve mode should use the text-only path.
@@ -410,9 +426,15 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
-        """Run the target model and return logits plus optional hidden states."""
-        if not collect_hidden_states:
+        """Run the target model and return logits plus optional hidden states.
+
+        ``logits_indices`` projects the head outside the model's own
+        ``__call__``, so callers must gate it on
+        :meth:`supports_selective_logits`; this method trusts them.
+        """
+        if logits_indices is None and not collect_hidden_states:
             output = model(input_ids, cache=cache)
             return TargetModelForwardOutput(
                 logits=self.extract_logits(output),
@@ -424,11 +446,58 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             input_ids,
             cache=cache,
         )
-        logits = self._compute_target_logits(model, hidden_states)
+        flat_hidden_states = self._flatten_target_hidden_states(hidden_states)
+        if logits_indices is None:
+            logits = self._compute_target_logits(model, hidden_states)
+            return TargetModelForwardOutput(
+                logits=logits,
+                hidden_states=flat_hidden_states if collect_hidden_states else None,
+            )
+
+        # `[None]` restores the leading batch axis the callers' `logits[0, row]`
+        # indexing expects. The hidden states stay row-major over ALL input rows,
+        # so the drafter's `target_hidden_row` keeps indexing the packed layout.
+        selected_hidden_states = mx.take(flat_hidden_states, logits_indices, axis=0)
         return TargetModelForwardOutput(
-            logits=logits,
-            hidden_states=self._flatten_target_hidden_states(hidden_states),
+            logits=self._compute_target_logits(model, selected_hidden_states[None]),
+            hidden_states=flat_hidden_states if collect_hidden_states else None,
         )
+
+    def supports_selective_logits(self, model: Any) -> bool:
+        """Whether the split backbone/head path reproduces this model's head.
+
+        No ``mlx_lm`` model exposes a ``compute_logits`` contract, and some scale
+        the head output inside their own ``__call__`` (Cohere's ``logit_scale``,
+        Granite's ``logits_scaling``), which `_compute_target_logits` would not
+        reproduce — a silent wrong-logits bug rather than a crash. Rather than
+        keep a model allowlist in sync with ``mlx_lm``, probe the loaded object
+        for bit-exact agreement on one row.
+
+        Resolved once after load: the probe runs a cacheless forward, which is
+        only safe while no ``PagedAttentionContext`` is installed.
+        """
+        probe_ids = mx.zeros((1, 1), dtype=mx.int32)
+        try:
+            reference = self.extract_logits(model(probe_ids, cache=None))
+            hidden_states = self._forward_target_hidden_states(
+                model, probe_ids, cache=None
+            )
+            split = self._compute_target_logits(model, hidden_states)
+            mx.eval(reference, split)
+            # array_equal is False on a shape mismatch, so this covers both.
+            matches = bool(mx.array_equal(reference, split).item())
+        except Exception:
+            # A wrapper the split path cannot drive (extra forward argument,
+            # missing backbone, unexpected output container).
+            matches = False
+
+        if not matches:
+            logger.info(
+                "Metal: %s output head is not reproducible outside its forward; "
+                "using full logits.",
+                type(model).__name__,
+            )
+        return matches
 
     def target_input_embeddings(self, model: Any, input_ids: mx.array) -> mx.array:
         """Return target/backbone-dim token embeddings for Gemma4 MTP feedback."""
@@ -552,9 +621,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
         model_type = getattr(hf_config, "model_type", "")
         architectures = getattr(hf_config, "architectures", ()) or ()
-        if model_type in _QWEN3_VL_MODEL_TYPES or any(
-            arch in _QWEN3_VL_ARCHITECTURES for arch in architectures
-        ):
+        if self._is_qwen3_vl_family(hf_config):
             from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 
             return cast(
@@ -660,7 +727,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 types surface loudly here instead of silently falling back
                 to full-attention shapes.
         """
-        layer_types = args.get("layer_types", [])
+        layer_types = args.get("layer_types") or []
         global_head_dim = args.get("global_head_dim")
         if len(layer_types) != num_layers or not global_head_dim:
             return None
@@ -693,17 +760,28 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
     def build_sliding_window_per_layer(
         self, args: dict[str, Any], num_layers: int
     ) -> list[int] | None:
-        """Return per-layer sliding window sizes for Gemma4, else None.
+        """Return model-authoritative per-layer sliding window sizes.
 
-        Gemma4 sliding-attention layers enforce a local window
-        (``config.sliding_window``); full-attention layers attend to the
-        entire context (represented as ``-1``).  Models without
-        ``layer_types`` or ``sliding_window`` in their config return
-        ``None``, keeping the current disabled-everywhere behavior.
+        Explicit ``layer_types`` identify sliding and full layers directly.
+        mlx-lm filters that field out of EXAONE's ``ModelArgs``, so for EXAONE
+        derive the same cyclic layout its model constructor uses from the
+        retained ``sliding_window_pattern``. Full-attention layers use ``-1``.
+        Models without either authoritative layout or ``sliding_window`` return
+        ``None``, keeping window enforcement disabled everywhere.
         """
-        layer_types: list[str] = args.get("layer_types", [])
         sliding_window = args.get("sliding_window")
-        if len(layer_types) != num_layers or not sliding_window:
+        if not sliding_window:
+            return None
+
+        layer_types = args.get("layer_types")
+        if layer_types is None and args.get("model_type") == "exaone4":
+            pattern = args.get("sliding_window_pattern")
+            if isinstance(pattern, str):
+                from vllm_metal.compat import _exaone4_layer_types_from_pattern
+
+                layer_types = _exaone4_layer_types_from_pattern(pattern, num_layers)
+
+        if layer_types is None or len(layer_types) != num_layers:
             return None
 
         sw = int(sliding_window)

@@ -7,8 +7,9 @@ import logging
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
-import mlx.core as mx
 from vllm.lora.layers import LoRAMapping
+
+from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
 
 from .worker_manager import MetalWorkerLoRAManager
 
@@ -24,16 +25,20 @@ class _LoRAMappingBuilder:
     def __init__(self) -> None:
         self._idx: list[int] = []
         self._prompt: list[int] = []
-        self._is_prefill = False
+        self._use_prefill_routing = True
 
     def add_request(self, lora_id: int | None, num_tokens: int) -> None:
         token_id = 0 if lora_id is None else int(lora_id)
         self._idx += [token_id] * num_tokens
         self._prompt.append(token_id)
-        self._is_prefill |= num_tokens > 1
+        self._use_prefill_routing &= num_tokens > 1
 
     def build(self) -> LoRAMapping:
-        return LoRAMapping(tuple(self._idx), tuple(self._prompt), self._is_prefill)
+        return LoRAMapping(
+            tuple(self._idx),
+            tuple(self._prompt),
+            self._use_prefill_routing,
+        )
 
     def is_empty(self) -> bool:
         return not self._idx
@@ -44,7 +49,7 @@ class MetalLoRARuntime:
 
     def __init__(self) -> None:
         self._manager: MetalWorkerLoRAManager | None = None
-        self._loaded: dict[int, LoRARequest] = {}
+        self._requests_by_id: dict[int, LoRARequest] = {}
 
     @property
     def enabled(self) -> bool:
@@ -60,7 +65,6 @@ class MetalLoRARuntime:
         speculative_decode_enabled: bool,
         max_num_seqs: int,
         max_num_batched_tokens: int,
-        dtype: mx.Dtype,
         max_position_embeddings: int | None,
     ) -> None:
         if lora_config is None:
@@ -91,7 +95,7 @@ class MetalLoRARuntime:
             lora_config=lora_config,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
-            dtype=dtype,
+            dtype=TORCH_TO_MLX_DTYPE[lora_config.lora_dtype],
             max_position_embeddings=max_position_embeddings,
         )
 
@@ -103,7 +107,7 @@ class MetalLoRARuntime:
             return False
         added = self._manager.add_adapter(lora_request)
         if added:
-            self._loaded[lora_request.lora_int_id] = lora_request
+            self._requests_by_id[lora_request.lora_int_id] = lora_request
         return added
 
     def remove_adapter(self, lora_id: int) -> bool:
@@ -111,7 +115,7 @@ class MetalLoRARuntime:
             return False
         removed = self._manager.remove_adapter(lora_id)
         if removed:
-            self._loaded.pop(lora_id, None)
+            self._requests_by_id.pop(lora_id, None)
         return removed
 
     def pin_adapter(self, lora_id: int) -> bool:
@@ -134,14 +138,14 @@ class MetalLoRARuntime:
             builder.add_request(lora_id, num_tokens)
             if lora_id is None:
                 continue
-            req = self._loaded.get(lora_id)
-            if req is None:
+            lora_request = self._requests_by_id.get(lora_id)
+            if lora_request is None:
                 raise ValueError(
                     f"LoRA id {lora_id} was routed for this step but is not "
-                    f"loaded (loaded ids: {sorted(self._loaded)}). The engine "
+                    f"known (known ids: {sorted(self._requests_by_id)}). The engine "
                     "must call add_lora before scheduling a request that uses "
                     "it."
                 )
-            active_requests.add(req)
+            active_requests.add(lora_request)
         mapping = builder.build() if not builder.is_empty() else None
         self._manager.set_active_adapters(active_requests, mapping)

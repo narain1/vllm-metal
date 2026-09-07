@@ -213,6 +213,7 @@ def _pooling_model_config(**overrides):
         "tokenizer": "stub-pooling-model",
         "tokenizer_revision": None,
         "get_head_size": lambda: 128,
+        "is_hybrid": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -619,7 +620,7 @@ class TestMetalPoolingCapabilities:
             patch.object(lifecycle, "resolve_model_dims"),
             patch.object(lifecycle, "_install_runtime_extensions"),
         ):
-            runner._lora = SimpleNamespace(setup=setup_lora)
+            runner._lora = SimpleNamespace(enabled=False, setup=setup_lora)
             runner.load_model()
 
         assert events == ["lora"]

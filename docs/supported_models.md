@@ -52,11 +52,14 @@ Native multimodal support currently targets image-only vision-language requests 
 `Automatic Prefix Cache` is the default behavior when you do not pass
 `--enable-prefix-caching`. Since
 [#283](https://github.com/vllm-project/vllm-metal/pull/283), unified paged-KV
-models reuse shared prefixes by default. Upstream vLLM keeps it off for
-hybrid/Mamba models; hybrid GDN models opt in with `--enable-prefix-caching`
-since [#584](https://github.com/vllm-project/vllm-metal/pull/584), so those rows
-are `🔵`. These values describe default engine behavior, not exhaustive
-per-model benchmarking on Metal.
+models reuse shared prefixes by default. As of vLLM 0.28.0, hybrid/Mamba
+models do too; hybrid GDN support remains experimental (`🔵`). Nemotron-H keeps
+one private Mamba-2 state slot per request, so prefix caching is downgraded to
+off for it and the decode pipeline stays off; only the mlx-community Nemotron
+3.5 Lightning MLX checkpoints load, since mlx-lm does not read
+`attention_head_dim` from the `nvidia/Nemotron-H-*` configs yet. These values
+describe default engine behavior, not exhaustive per-model benchmarking on
+Metal.
 
 HF AWQ checkpoints load through mlx-lm's `_transform_awq_weights` repack, with an
 entry-point preflight that normalizes AutoAWQ aliases (`w_bit`, `q_group_size`,
@@ -66,20 +69,22 @@ for Qwen2.5, Llama 3, and Mistral
 ([#340](https://github.com/vllm-project/vllm-metal/pull/340),
 [#381](https://github.com/vllm-project/vllm-metal/pull/381)).
 
-Local GGUF checkpoints serve by detection like AWQ, with no env flag:
+GGUF checkpoints serve by detection like AWQ, with no env flag:
 vllm-metal's GGUF engine integration sets `quantization=gguf` from the file
 (vLLM 0.24 moved its in-tree GGUF support to the CUDA/ROCm-only
 [vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). A
 `.gguf` carries weights only, so it pairs with a companion config dir
-(`--tokenizer`) and needs the `gguf` extra; the weights stay MLX-native
+(`--tokenizer`) and needs the `gguf` extra; remote `repo_id:quant` references
+download one matching unsharded `.gguf` file. The weights stay MLX-native
 quantized (Q8_0/Q4_0/Q4_1, not a dense fallback). Scope is dense
 `qwen2`/`qwen3`/`llama`/`mistral` (mistral converts under the llama GGUF arch)
 with per-tensor `Q8_0`/`Q4_0`/`Q4_1`; K-quants, fused-QKV, MoE, SSM/hybrid,
-vision, and remote `repo:quant` are rejected with a clear error. The narrow
-exception is an unused tied `output.weight`: MLX may briefly materialize an
-unsupported qtype such as Q6_K as FP16 before the loader discards it. Preflight
-limits that transient table to 512 MiB. Verified end-to-end on Qwen3-0.6B Q4_1
-and on Qwen3-0.6B,
+vision, ambiguous remote matches, and sharded remote GGUF files are rejected
+with a clear error. See [GGUF](gguf.md) for serve examples and source
+precedence. The narrow exception is an unused tied `output.weight`: MLX may
+briefly materialize an unsupported qtype such as Q6_K as FP16 before the loader
+discards it. Preflight limits that transient table to 512 MiB. Verified
+end-to-end on Qwen3-0.6B Q4_1 and on Qwen3-0.6B,
 Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415)).
 
@@ -88,11 +93,15 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | Qwen3 | ✅ | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
 | Qwen3.5 / 3.6 / 3.8 | ✅ | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
 | Qwen3-Next | ✅ | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
+| LFM2 / LFM2.5 | ✅ | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
+| Nemotron-H (Nemotron 3.5 Lightning) | 🔵 | Hybrid SDPA + Mamba-2 (MoE) | ❌ | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` |
 | Gemma 4 | ✅ | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-E2B-it` |
 | Gemma 3 | ✅ | GQA (paged) | ✅ | `mlx-community/gemma-3-1b-it-qat-4bit` |
 | Llama 3 | ✅ | GQA (paged) | ✅ | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` |
 | Mistral-7B | ✅ | GQA (paged) | ✅ | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` |
 | Mistral-Small-24B | 🔵 | GQA (paged) | ✅ | `mlx-community/Mistral-Small-24B-Instruct-2501-4bit` |
+| StableLM 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/stablelm-2-zephyr-1_6b-4bit` |
+| Phi 1.5 / Phi 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/phi-2-hf-4bit-mlx` |
 | GPT-OSS | 🔵 | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
 | GLM-4.5 | 🟡 | MLA (paged latent cache, MLX SDPA — no Metal kernel) | 🟡 | — |
 | MiniCPM3-4B | ✅ | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
@@ -107,3 +116,4 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | Granite 3.3 | 🔵 | GQA (paged) | ✅ | `mlx-community/granite-3.3-8b-instruct-4bit` |
 | EXAONE 4.0 | 🔵 | GQA (paged) | ✅ | `mlx-community/exaone-4.0-1.2b-4bit` |
 | Laguna | ✅  | GQA (paged) | ✅ | `poolside/Laguna-XS-2.1-NVFP4-mlx` |
+| Hunyuan (dense) | ✅ | GQA + QK norm (paged) | ✅ | `mlx-community/Hunyuan-1.8B-Instruct-4bit` |

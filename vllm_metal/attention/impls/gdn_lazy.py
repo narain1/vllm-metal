@@ -75,7 +75,6 @@ class GDNRecurrentPrefillRequest(GDNRecurrentRequest):
     """Inputs for one lazy GDN recurrent prefill-containing attempt."""
 
     cu_seqlens: list[int]
-    materialize_outputs: bool = False
     compute_dtype: mx.Dtype | None = None
     defer_state_scatter: bool = False
 
@@ -252,7 +251,6 @@ class GDNLazyKernels:
         kernel_size = inner.conv_kernel_size
         state_view = state_cache.conv_state_for_decode(cache_idx, slot_ids)
         conv_state_in = state_view.state
-        state_pool = state_cache.conv_states[cache_idx]
         weight = inner.conv1d.weight
 
         mixed_qkv_2d = mixed_qkv.reshape(num_requests, conv_dim)
@@ -284,8 +282,7 @@ class GDNLazyKernels:
             output_shapes=[(num_requests, conv_dim), state_updates_shape],
             output_dtypes=[mixed_qkv.dtype, conv_state_in.dtype],
         )
-        state_pool[slot_ids_arr] = conv_state_updates
-        state_cache.store_conv_state(cache_idx, state_pool)
+        state_cache.write_conv_rows(cache_idx, conv_state_updates, slot_ids_arr)
         if state_view.uses_compact_state:
             state_cache.clear_pending_conv_state(cache_idx)
         return conv_silu_out.reshape(1, total_tokens, conv_dim)
@@ -502,14 +499,9 @@ class GDNLazyKernels:
             request.state_cache.set_pending_recurrent_state(
                 request.cache_idx, request.slot_ids, state_updates
             )
-            state_to_materialize = state_updates
         else:
-            state_in[slot_ids_arr] = state_updates
-            if request.materialize_outputs:
-                state_in = mx.contiguous(state_in)
-            request.state_cache.store_recurrent_state(request.cache_idx, state_in)
-            state_to_materialize = state_in
+            request.state_cache.write_recurrent_rows(
+                request.cache_idx, state_updates, slot_ids_arr
+            )
         y_out = _astype_if_needed(y_out, request.output_dtype)
-        if request.materialize_outputs:
-            mx.eval(y_out, state_to_materialize)
         return y_out

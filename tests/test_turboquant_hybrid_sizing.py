@@ -16,7 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import make_gdn_hybrid_plan, make_stub_runner
 from vllm_metal.config import MetalConfig
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import (
@@ -44,12 +44,17 @@ TQ_PAGE = turboquant_page_size_bytes(
 
 def _hybrid_runner():
     return make_stub_runner(
-        model_args={"full_attention_interval": 4},
+        is_hybrid=True,
         num_layers=NUM_LAYERS,
-        full_attention_interval=4,
-        sdpa_layer_indices=set(SDPA_LAYERS),
-        num_sdpa_layers=len(SDPA_LAYERS),
-        num_linear_layers=NUM_LAYERS - len(SDPA_LAYERS),
+        hybrid_runtime_plan=make_gdn_hybrid_plan(
+            NUM_LAYERS,
+            SDPA_LAYERS,
+            conv_kernel_dim=4,
+            conv_dim=1024,
+            num_v_heads=16,
+            value_head_dim=64,
+            key_head_dim=64,
+        ),
         num_kv_heads=KV_HEADS,
         head_dim=HEAD_DIM,
         kv_cache_dtype=mx.float16,
@@ -60,11 +65,6 @@ def _hybrid_runner():
             mamba_cache_mode="none",
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
-        linear_conv_kernel_dim=4,
-        linear_conv_dim=1024,
-        linear_num_v_heads=16,
-        linear_value_head_dim=64,
-        linear_key_head_dim=64,
     )
 
 
@@ -104,12 +104,17 @@ class TestHybridTurboQuantCachePolicy:
 
         for sdpa_layers in ([3, 7], [0, 4]):
             runner = make_stub_runner(
-                model_args={"full_attention_interval": 4},
+                is_hybrid=True,
                 num_layers=NUM_LAYERS,
-                full_attention_interval=4,
-                sdpa_layer_indices=set(sdpa_layers),
-                num_sdpa_layers=len(sdpa_layers),
-                num_linear_layers=NUM_LAYERS - len(sdpa_layers),
+                hybrid_runtime_plan=make_gdn_hybrid_plan(
+                    NUM_LAYERS,
+                    sdpa_layers,
+                    conv_kernel_dim=4,
+                    conv_dim=1024,
+                    num_v_heads=16,
+                    value_head_dim=64,
+                    key_head_dim=64,
+                ),
                 num_kv_heads=KV_HEADS,
                 head_dim=HEAD_DIM,
                 kv_cache_dtype=mx.float16,
@@ -120,11 +125,6 @@ class TestHybridTurboQuantCachePolicy:
                     mamba_cache_mode="none",
                 ),
                 scheduler_config=SimpleNamespace(max_num_seqs=4),
-                linear_conv_kernel_dim=4,
-                linear_conv_dim=1024,
-                linear_num_v_heads=16,
-                linear_value_head_dim=64,
-                linear_key_head_dim=64,
             )
             with patch(
                 "vllm_metal.v1.cache_policy.get_config", return_value=_tq_config()
@@ -219,6 +219,31 @@ class TestTurboQuantHybridAlignment:
         expected_page = expected_block * self._TQ_PAGE_1_TOKEN
         assert expected_page >= self._MAMBA_PAGE
         assert vllm_config.cache_config.mamba_page_size_padded == expected_page
+
+    def test_realign_resyncs_mamba_block_size_under_align(self, monkeypatch) -> None:
+        """Growing the block size must drag mamba_block_size along under align.
+
+        vLLM 0.28.0 pins mamba_block_size = block_size for align mode before
+        the platform hook runs; without the re-sync the hybrid coordinator's
+        divisibility asserts fail at engine startup.
+        """
+        vllm_config = self._vllm_config(block_size=544)
+        vllm_config.cache_config.mamba_cache_mode = "align"
+        vllm_config.cache_config.mamba_block_size = 544
+        monkeypatch.setattr("vllm_metal.platform.get_config", lambda: _tq_config())
+        self._patch_model_cls(monkeypatch)
+
+        MetalPlatform._realign_hybrid_block_size_for_turboquant(
+            vllm_config,
+            user_block_size=None,
+            hash_block_size=None,
+        )
+
+        assert vllm_config.cache_config.block_size != 544
+        assert (
+            vllm_config.cache_config.mamba_block_size
+            == vllm_config.cache_config.block_size
+        )
 
     def test_realign_noop_without_turboquant(self, monkeypatch) -> None:
         vllm_config = self._vllm_config(block_size=544)
